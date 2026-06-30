@@ -5,6 +5,8 @@ go 1.26.3
 require github.com/ilyakaznacheev/cleanenv v1.5.0
 
 require (
+	github.com/huandu/go-clone v1.7.3 // indirect
+	github.com/huandu/xstrings v1.4.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
@@ -17,6 +19,7 @@ require (
 	github.com/BurntSushi/toml v1.2.1 // indirect
 	github.com/golang-migrate/migrate v3.5.4+incompatible
 	github.com/google/uuid v1.6.0
+	github.com/huandu/go-sqlbuilder v1.42.1
 	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/joho/godotenv v1.5.1 // indirect
