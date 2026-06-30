@@ -5,6 +5,8 @@ import (
 
 	"github.com/Voltage11/tplatform/internal/config"
 	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/repository"
+	"github.com/Voltage11/tplatform/internal/service"
 	"github.com/Voltage11/tplatform/pkg/logger"
 )
 
@@ -28,7 +30,22 @@ func main() {
 		log.Fatalf("ошибка подключения к postgres: %v", err)
 	}
 	appLogger.Info("Подключение к БД успешно")
-	_ = dbPostgres
+
+	// Репозитории
+	permissionRepo := repository.NewPermissionsRepository(dbPostgres.Pool)
+	departmentRepo := repository.NewDepartmentRepository(dbPostgres.Pool)
+	roleRepo := repository.NewRoleRepository(dbPostgres.Pool)
+	userRepo := repository.NewUserRepository(dbPostgres.Pool)
+
+	// Сервис
+	permissionService := service.NewPermissionService(permissionRepo)
+	departmentService := service.NewDepartmentService(departmentRepo, permissionService)
+	roleService := service.NewRoleService(roleRepo)
+	userService := service.NewUserService(userRepo)
+
+	_ = departmentService
+	_ = roleService
+	_ = userService
 
 	// Установим уровень логирования из конфигурации после старта сервера
 	appLogger.SetLevel(cfg.Logger.Level)
