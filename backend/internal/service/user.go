@@ -20,16 +20,21 @@ const (
 type userService struct {
 	repo  domain.UserRepository
 	cache cache.UserCache
+	permissionServise domain.PermissionService
 }
 
-func NewUserService(repo domain.UserRepository) domain.UserService {
+func NewUserService(repo domain.UserRepository, permissionServise domain.PermissionService) domain.UserService {
 	return &userService{
 		repo:  repo,
 		cache: cache.NewUserCache(userCacheDuration),
+		permissionServise: permissionServise,
 	}
 }
 
 func (u *userService) Create(ctx context.Context, user *domain.User) error {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionCreate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
 
 	user.PasswordHash = hash.ToHash(user.PasswordHash)
 
@@ -42,6 +47,10 @@ func (u *userService) Create(ctx context.Context, user *domain.User) error {
 }
 
 func (u *userService) Update(ctx context.Context, user *domain.User) error {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+	
 	if err := u.repo.Update(ctx, user); err != nil {
 		return err
 	}
@@ -51,6 +60,10 @@ func (u *userService) Update(ctx context.Context, user *domain.User) error {
 }
 
 func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+	
 	if err := u.repo.SetIsActive(ctx, id, isActive); err != nil {
 		return err
 	}
@@ -60,6 +73,10 @@ func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bo
 }
 
 func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionHardDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+	
 	if err := u.repo.HardDelete(ctx, id); err != nil {
 		return err
 	}
@@ -69,6 +86,10 @@ func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionSoftDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+	
 	if err := u.repo.SoftDelete(ctx, id); err != nil {
 		return err
 	}
@@ -78,6 +99,10 @@ func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+	
 	// Проверяем кэш
 	if user := u.cache.GetByID(id); user != nil {
 		return user, nil
@@ -93,10 +118,18 @@ func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, 
 }
 
 func (u *userService) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.UserWithDetail, error) {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+	
 	return u.repo.GetByIDWithDetail(ctx, id)
 }
 
 func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+	
 	// Проверяем кэш
 	if user := u.cache.GetByEmail(email); user != nil {
 		return user, nil
@@ -112,11 +145,19 @@ func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.Use
 }
 
 func (u *userService) GetByEmailWithDetail(ctx context.Context, email string) (*domain.UserWithDetail, error) {
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+	
 	return u.repo.GetByEmailWithDetail(ctx, email)
 }
 
 func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*domain.PagedResult[*domain.UserWithDetail], error) {
-	// Пагинацию обычно не кэшируют, так как фильтров слишком много
+	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+
 	users, total, err := u.repo.GetList(ctx, filter)
 	if err != nil {
 		return nil, err

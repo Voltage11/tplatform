@@ -43,8 +43,8 @@ func main() {
 	defer permissionService.Shutdown()
 
 	departmentService := service.NewDepartmentService(departmentRepo, permissionService)
-	roleService := service.NewRoleService(roleRepo)
-	userService := service.NewUserService(userRepo)
+	roleService := service.NewRoleService(roleRepo, permissionService)
+	userService := service.NewUserService(userRepo, permissionService)
 
 	_ = departmentService
 	_ = roleService

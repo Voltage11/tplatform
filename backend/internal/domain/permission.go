@@ -40,6 +40,7 @@ type PermissionEntity struct {
 var (
 	EntityDepartments = PermissionEntity{Name: "departments", Description: "Отделы"}
 	EntityUsers       = PermissionEntity{Name: "users", Description: "Пользователи"}
+	EntityRoles       = PermissionEntity{Name: "roless", Description: "Роли"}
 )
 
 // PermissionEntityWithActions — сущность с набором возможных действий
