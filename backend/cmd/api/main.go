@@ -4,7 +4,7 @@ import (
 	"log"
 
 	"github.com/Voltage11/tplatform/internal/config"
-	"github.com/Voltage11/tplatform/internal/config/db"
+	"github.com/Voltage11/tplatform/internal/db"
 	"github.com/Voltage11/tplatform/pkg/logger"
 )
 
