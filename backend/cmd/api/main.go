@@ -28,6 +28,7 @@ func main() {
 		log.Fatalf("ошибка подключения к postgres: %v", err)
 	}
 	appLogger.Info("Подключение к БД успешно")
+	_ = dbPostgres
 
 	// Установим уровень логирования из конфигурации после старта сервера
 	appLogger.SetLevel(cfg.Logger.Level)

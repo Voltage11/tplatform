@@ -63,7 +63,10 @@ func (l *appLogger) ErrorCtx(ctx context.Context, msg string, args ...any) {
 	l.logger.ErrorContext(ctx, msg, args...)
 }
 
-func (l *appLogger) SetLevel(levelStr string) { l.levelVar.Set(parseLevel(levelStr)) }
+func (l *appLogger) SetLevel(levelStr string) { 
+	l.logger.Info("уровень логирования", "установлен на", levelStr)
+	l.levelVar.Set(parseLevel(levelStr)) 	
+}
 
 func parseLevel(levelStr string) slog.Level {
 	switch levelStr {
