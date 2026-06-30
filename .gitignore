@@ -1,32 +1,65 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# ==========================================
+# Общие системные файлы (OS / IDES)
+# ==========================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
 
-# Test binary, built with `go test -c`
-*.test
+# ==========================================
+# Go
+# ==========================================
+# Компилированные бинарники и исполняемые файлы
+backend/bin/
+backend/*.exe
+backend/*.exe~
+backend/*.dll
+backend/*.so
+backend/*.dylib
+backend/backend  # если бинарник называется как папка
 
-# Code coverage profiles and other test artifacts
-*.out
-coverage.*
-*.coverprofile
-profile.cov
+# Файлы архитектуры и тестов
+backend/*.test
+backend/*.out
+backend/vendor/
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# ==========================================
+# Vue / Node.js
+# ==========================================
+# Зависимости
+frontend/node_modules/
+frontend/jspm_packages/
 
-# Go workspace file
-go.work
-go.work.sum
+# Директории сборки (дистрибутив)
+frontend/dist/
+frontend/local
 
-# env file
-.env
+# Логи npm/yarn/pnpm
+frontend/*.log
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Кэш инструментов сборки
+frontend/.nuxt
+frontend/.next
+frontend/.vuepress/dist
+frontend/.cache/
+
+# ==========================================
+# Секреты и конфигурация (ВАЖНО)
+# ==========================================
+# Исключаем файлы окружения, содержащие пароли и ключи
+*.env
+*.env.*
+backend/.env
+backend/.env.local
+
+# Разрешаем коммитить только шаблоны настроек
+!*.env.example
