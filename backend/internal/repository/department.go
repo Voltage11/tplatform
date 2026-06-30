@@ -95,8 +95,7 @@ func (d *departmentRepository) GetList(ctx context.Context, filter domain.Depart
 		From("departments").
 		Where(sbFilter.IsNull("deleted_at"))
 
-	sbCount.Select("COUNT(*)").
-		From("departments").
+	sbCount.Select("COUNT(*)").From("departments").
 		Where(sbCount.IsNull("deleted_at"))
 
 	if filter.Name != "" {
@@ -109,45 +108,9 @@ func (d *departmentRepository) GetList(ctx context.Context, filter domain.Depart
 		Offset(filter.Pagination.GetOffset()).
 		OrderBy("name")
 
-	queryFilter, argsFilter := sbFilter.Build()
-	queryCount, argsCount := sbCount.Build()
-
-	tx, err := d.pool.Begin(ctx)
-	if err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	defer tx.Rollback(ctx)
-
-	var total int64
-	if err := tx.QueryRow(ctx, queryCount, argsCount...).Scan(&total); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	if total == 0 {
-		return []*domain.Department{}, 0, nil
-	}
-
-	rows, err := tx.Query(ctx, queryFilter, argsFilter...)
-	if err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	defer rows.Close()
-
-	departments := make([]*domain.Department, 0)
-	for rows.Next() {
+	return getList(ctx, d.pool, sbFilter, sbCount, func(scanner rowScanner) (*domain.Department, error) {
 		var dep domain.Department
-		if err := rows.Scan(&dep.ID, &dep.Name, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt); err != nil {
-			return nil, 0, apperror.NewPostgresError(err)
-		}
-		departments = append(departments, &dep)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	return departments, total, nil
+		err := scanner.Scan(&dep.ID, &dep.Name, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt)
+		return &dep, err
+	})
 }

@@ -6,7 +6,6 @@ import (
 
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
-	"github.com/Voltage11/tplatform/internal/types/filterbool"
 	"github.com/Voltage11/tplatform/pkg/helpers"
 	"github.com/google/uuid"
 	"github.com/huandu/go-sqlbuilder"
@@ -287,14 +286,14 @@ func (u *userRepository) GetList(ctx context.Context, filter domain.UserFilter) 
 	sbFilter := sqlbuilder.PostgreSQL.NewSelectBuilder()
 	sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
 
-	// Фильтр с LEFT JOIN
+	// Основной фильтр с LEFT JOIN
 	sbFilter.Select(
 		"u.id", "u.first_name", "u.second_name", "u.last_name",
 		"u.email", "u.password_hash",
 		"u.department_id", "u.role_id", "u.is_active", "u.is_admin",
 		"u.created_at", "u.updated_at", "u.deleted_at",
-		"d.id as dept_id", "d.name as dept_name",
-		"r.id as role_id_val", "r.name as role_name",
+		"d.id AS dept_id", "d.name AS dept_name",
+		"r.id AS role_id_val", "r.name AS role_name",
 	).
 		From("users u").
 		JoinWithOption(sqlbuilder.LeftJoin, "departments d", "u.department_id = d.id").
@@ -304,7 +303,7 @@ func (u *userRepository) GetList(ctx context.Context, filter domain.UserFilter) 
 	sbCount.Select("COUNT(*)").From("users u").
 		Where(sbCount.IsNull("u.deleted_at"))
 
-	// Фильтры (без изменений)
+	// Фильтры
 	if filter.FirstName != "" {
 		pattern := "%" + filter.FirstName + "%"
 		sbFilter.Where(sbFilter.ILike("u.first_name", pattern))
@@ -333,64 +332,20 @@ func (u *userRepository) GetList(ctx context.Context, filter domain.UserFilter) 
 		sbFilter.Where(sbFilter.Equal("u.role_id", *filter.RoleID))
 		sbCount.Where(sbCount.Equal("u.role_id", *filter.RoleID))
 	}
-	if filter.IsActive != filterbool.FilterBoolAll {
-		if isActive := filter.IsActive.GetBool(); isActive != nil {
-			sbFilter.Where(sbFilter.Equal("u.is_active", *isActive))
-			sbCount.Where(sbCount.Equal("u.is_active", *isActive))
-		}
+	if isActive := filter.IsActive.GetBool(); isActive != nil {
+		sbFilter.Where(sbFilter.Equal("u.is_active", *isActive))
+		sbCount.Where(sbCount.Equal("u.is_active", *isActive))
 	}
 
-	// Пагинация и сортировка
 	sbFilter.Limit(filter.Pagination.GetLimit()).
 		Offset(filter.Pagination.GetOffset()).
 		OrderBy("u.last_name")
 
-	query, args := sbFilter.Build()
-	queryCount, argsCount := sbCount.Build()
-
-	// Транзакция
-	tx, err := u.pool.Begin(ctx)
-	if err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	defer tx.Rollback(ctx)
-
-	var total int64
-	if err := tx.QueryRow(ctx, queryCount, argsCount...).Scan(&total); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	if total == 0 {
-		return []*domain.UserWithDetail{}, 0, nil
-	}
-
-	rows, err := tx.Query(ctx, query, args...)
-	if err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	defer rows.Close()
-
-	users := make([]*domain.UserWithDetail, 0)
-	for rows.Next() {
-		usr, err := scanUserRow(rows) // используем общую функцию сканирования
-		if err != nil {
-			return nil, 0, apperror.NewPostgresError(err)
-		}
-		users = append(users, usr)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	return users, total, nil
+	// Используем универсальный getList с готовой scanUserRow
+	return getList(ctx, u.pool, sbFilter, sbCount, scanUserRow)
 }
 
-func scanUserRow(scanner interface {
-	Scan(dest ...any) error
-}) (*domain.UserWithDetail, error) {
+func scanUserRow(scanner rowScanner) (*domain.UserWithDetail, error) {
 	usr := &domain.UserWithDetail{}
 	var deptID, roleID uuid.NullUUID
 	var deptIDPtr, roleIDPtr *uuid.UUID

@@ -64,7 +64,6 @@ func (r *roleRepository) Delete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (r *roleRepository) GetList(ctx context.Context, filter domain.RoleFilter) ([]*domain.Role, int64, error) {
-
 	sbFilter := sqlbuilder.PostgreSQL.NewSelectBuilder()
 	sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
 
@@ -72,8 +71,7 @@ func (r *roleRepository) GetList(ctx context.Context, filter domain.RoleFilter) 
 		From("roles").
 		Where(sbFilter.IsNull("deleted_at"))
 
-	sbCount.Select("COUNT(*)").
-		From("roles").
+	sbCount.Select("COUNT(*)").From("roles").
 		Where(sbCount.IsNull("deleted_at"))
 
 	if filter.Name != "" {
@@ -86,45 +84,9 @@ func (r *roleRepository) GetList(ctx context.Context, filter domain.RoleFilter) 
 		Offset(filter.Pagination.GetOffset()).
 		OrderBy("name")
 
-	queryFilter, argsFilter := sbFilter.Build()
-	queryCount, argsCount := sbCount.Build()
-
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	defer tx.Rollback(ctx)
-
-	var total int64
-	if err := tx.QueryRow(ctx, queryCount, argsCount...).Scan(&total); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	if total == 0 {
-		return []*domain.Role{}, 0, nil
-	}
-
-	rows, err := tx.Query(ctx, queryFilter, argsFilter...)
-	if err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-	defer rows.Close()
-
-	roles := make([]*domain.Role, 0)
-	for rows.Next() {
-		var dep domain.Role
-		if err := rows.Scan(&dep.ID, &dep.Name, &dep.Description, &dep.CreatedAt); err != nil {
-			return nil, 0, apperror.NewPostgresError(err)
-		}
-		roles = append(roles, &dep)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, apperror.NewPostgresError(err)
-	}
-
-	return roles, total, nil
+	return getList(ctx, r.pool, sbFilter, sbCount, func(scanner rowScanner) (*domain.Role, error) {
+		var role domain.Role
+		err := scanner.Scan(&role.ID, &role.Name, &role.Description, &role.CreatedAt)
+		return &role, err
+	})
 }

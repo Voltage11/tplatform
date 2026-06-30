@@ -21,7 +21,7 @@ func (p PaginationRequest) GetLimit() int {
 // GetOffset рассчитывает сдвиг для SQL-запроса (OFFSET)
 func (p PaginationRequest) GetOffset() int {
 	if p.Page < 1 {
-		return 1
+		return 0
 	}
 	return (p.Page - 1) * p.GetLimit()
 }

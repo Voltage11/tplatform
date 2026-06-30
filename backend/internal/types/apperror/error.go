@@ -16,6 +16,8 @@ const (
 	ErrInternal      ErrType = "INTERNAL"
 )
 
+var ErrForbiddenGeneric = errors.New("доступ запрещён")
+
 type AppError struct {
 	Type    ErrType `json:"type"`
 	Message string  `json:"message"`
@@ -53,6 +55,10 @@ func NewUnauthorized(msg string, err error) error {
 
 func NewForbidden(msg string, err error) error {
 	return &AppError{Type: ErrForbidden, Message: msg, Err: err}
+}
+
+func NewForbiddenWithoutErr() error {
+	return &AppError{Type: ErrForbidden, Message: "нет прав", Err: ErrForbiddenGeneric}
 }
 
 func NewInternal(msg string, err error) error {

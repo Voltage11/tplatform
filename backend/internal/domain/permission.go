@@ -86,5 +86,6 @@ type PermissionService interface {
 	GetForRole(ctx context.Context, roleID uuid.UUID) ([]PermissionEntityWithActions, error)
 	// Can проверяет, может ли пользователь выполнить действие над сущностью
 	Can(ctx context.Context, user *User, entityName, actionName string) bool
+	CanFromCtx(ctx context.Context, entityName, actionName string) bool
 	Shutdown()
 }

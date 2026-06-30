@@ -29,6 +29,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("ошибка подключения к postgres: %v", err)
 	}
+	defer dbPostgres.Close()
 	appLogger.Info("Подключение к БД успешно")
 
 	// Репозитории
@@ -39,6 +40,8 @@ func main() {
 
 	// Сервис
 	permissionService := service.NewPermissionService(permissionRepo)
+	defer permissionService.Shutdown()
+
 	departmentService := service.NewDepartmentService(departmentRepo, permissionService)
 	roleService := service.NewRoleService(roleRepo)
 	userService := service.NewUserService(userRepo)

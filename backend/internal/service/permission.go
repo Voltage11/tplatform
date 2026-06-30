@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Voltage11/tplatform/internal/appcontext"
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/google/uuid"
 )
@@ -76,6 +77,10 @@ func (s *permissionService) GetForRole(ctx context.Context, roleID uuid.UUID) ([
 }
 
 func (s *permissionService) Can(ctx context.Context, user *domain.User, entityName, actionName string) bool {
+	if user == nil {
+		return false
+	}
+
 	if user.IsAdmin {
 		return true
 	}
@@ -98,10 +103,17 @@ func (s *permissionService) Can(ctx context.Context, user *domain.User, entityNa
 	return false
 }
 
+// CanFromCtx оптимизировал получение прав, пользователя берем из контекста
+func (s *permissionService) CanFromCtx(ctx context.Context, entityName, actionName string) bool {
+	user := appcontext.GetUserFromContext(ctx)
+
+	return s.Can(ctx, user, entityName, actionName)
+}
+
 // --- кэш ---
 
 func (s *permissionService) getCached(roleID uuid.UUID, loader func() ([]domain.RolePermission, error)) ([]domain.RolePermission, error) {
-	// быстрый путь: чтение из кэша
+	// быстрое чтение
 	s.cacheMu.RLock()
 	if cachedAt, ok := s.cachedAt[roleID]; ok && time.Since(cachedAt) < s.cacheTTL {
 		val := s.cache[roleID]
@@ -110,7 +122,7 @@ func (s *permissionService) getCached(roleID uuid.UUID, loader func() ([]domain.
 	}
 	s.cacheMu.RUnlock()
 
-	// загрузка из БД
+	// загрузка под write-lock
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 

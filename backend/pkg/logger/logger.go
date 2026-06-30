@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 )
@@ -35,7 +36,6 @@ func New(initialLevel string) Logger {
 	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: levelVar,
 	})
-	
 
 	return &appLogger{
 		logger:   slog.New(handler),
@@ -63,9 +63,11 @@ func (l *appLogger) ErrorCtx(ctx context.Context, msg string, args ...any) {
 	l.logger.ErrorContext(ctx, msg, args...)
 }
 
-func (l *appLogger) SetLevel(levelStr string) { 
-	l.logger.Info("уровень логирования", "установлен на", levelStr)
-	l.levelVar.Set(parseLevel(levelStr)) 	
+func (l *appLogger) SetLevel(levelStr string) {
+	newLevel := parseLevel(levelStr)
+	l.levelVar.Set(newLevel)
+
+	fmt.Fprintf(os.Stderr, "уровень логирования изменен на: %s\n", levelStr)
 }
 
 func parseLevel(levelStr string) slog.Level {
