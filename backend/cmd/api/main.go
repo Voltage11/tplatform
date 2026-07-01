@@ -3,6 +3,10 @@ package main
 import (
 	"log"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+
 	"github.com/Voltage11/tplatform/internal/config"
 	"github.com/Voltage11/tplatform/internal/db"
 	"github.com/Voltage11/tplatform/internal/repository"
@@ -49,6 +53,28 @@ func main() {
 	_ = departmentService
 	_ = roleService
 	_ = userService
+
+	// Роутер
+	r := chi.NewRouter()
+	
+	// ВСЕ MIDDLEWARE (должны быть до маршрутов)	
+
+	// CORS middleware
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   cfg.Server.AllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	// Стандартные middleware chi
+	r.Use(middleware.RequestID)
+	r.Use(middleware.ClientIPFromRemoteAddr)
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(cfg.Server.ReadTimeout))
+
 
 	// Установим уровень логирования из конфигурации после старта сервера
 	appLogger.SetLevel(cfg.Logger.Level)

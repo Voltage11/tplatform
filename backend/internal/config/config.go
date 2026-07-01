@@ -26,6 +26,7 @@ type ServerConfig struct {
 	ReadTimeout  time.Duration `env:"SERVER_READ_TIMEOUT" env-default:"10s"`
 	WriteTimeout time.Duration `env:"SERVER_WRITE_TIMEOUT" env-default:"10s"`
 	IdleTimeout  time.Duration `env:"SERVER_IDLE_TIMEOUT" env-default:"60s"`
+	AllowedOrigins []string `env:"ALLOWED_ORIGINS" env-separator:"," env-required:"true"` 
 }
 
 type DatabaseConfig struct {
