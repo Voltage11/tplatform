@@ -15,17 +15,29 @@ type DepartmentUpdateRequest struct {
 }
 
 type DepartmentResponse struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
-func DepartmentToResponse(department *domain.Department) DepartmentResponse {
-	return DepartmentResponse{
+func NewDepartmentToResponse(department *domain.Department) *DepartmentResponse {
+	return &DepartmentResponse{
 		ID:        department.ID.String(),
 		Name:      department.Name,
-		CreatedAt: department.CreatedAt,
-		UpdatedAt: department.UpdatedAt,
+		CreatedAt: department.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: department.UpdatedAt.Format(time.RFC3339),
 	}
+}
+
+func NewDepartmentsToResponse(departments []*domain.Department) []*DepartmentResponse {
+	if departments == nil {
+		return nil
+	}
+
+	out := make([]*DepartmentResponse, len(departments))
+	for i, department := range departments {
+		out[i] = NewDepartmentToResponse(department)
+	}
+	return out
 }
