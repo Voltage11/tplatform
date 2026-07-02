@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
+	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -9,8 +12,11 @@ import (
 
 	"github.com/Voltage11/tplatform/internal/config"
 	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/handler"
+	authmw "github.com/Voltage11/tplatform/internal/middleware"
 	"github.com/Voltage11/tplatform/internal/repository"
 	"github.com/Voltage11/tplatform/internal/service"
+	"github.com/Voltage11/tplatform/pkg/jwt"
 	"github.com/Voltage11/tplatform/pkg/logger"
 )
 
@@ -37,28 +43,38 @@ func main() {
 	appLogger.Info("Подключение к БД успешно")
 
 	// Репозитории
+	sessionRepo := repository.NewSessionRepository(dbPostgres.Pool)
 	permissionRepo := repository.NewPermissionsRepository(dbPostgres.Pool)
 	departmentRepo := repository.NewDepartmentRepository(dbPostgres.Pool)
 	roleRepo := repository.NewRoleRepository(dbPostgres.Pool)
 	userRepo := repository.NewUserRepository(dbPostgres.Pool)
 
 	// Сервис
+	jwtCfg := jwt.Config{
+		SecretKey:  cfg.JWT.Secret,
+		AccessTTL:  cfg.JWT.AccessTTL,
+		RefreshTTL: cfg.JWT.RefreshTTL,
+	}
+
 	permissionService := service.NewPermissionService(permissionRepo)
 	defer permissionService.Shutdown()
 
+	authService := service.NewAuthService(userRepo, sessionRepo, jwtCfg)
 	departmentService := service.NewDepartmentService(departmentRepo, permissionService)
 	roleService := service.NewRoleService(roleRepo, permissionService)
 	userService := service.NewUserService(userRepo, permissionService)
 
+	if err := userService.CheckOrCreateAdmin(context.Background(), cfg.Admin); err != nil {
+		log.Fatalf("ошибка создания админа: %v", err)
+	}
+
 	_ = departmentService
 	_ = roleService
-	_ = userService
 
 	// Роутер
 	r := chi.NewRouter()
-	
-	// ВСЕ MIDDLEWARE (должны быть до маршрутов)	
 
+	// ВСЕ MIDDLEWARE (должны быть до маршрутов)
 	// CORS middleware
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   cfg.Server.AllowedOrigins,
@@ -75,7 +91,26 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(cfg.Server.ReadTimeout))
 
+	// Кастомные наши middleware
+	authMiddleware := authmw.NewAuthMiddleware(authService, userService)
+	r.Use(authMiddleware.ExtractUser) // Прокидывание пользователя, если есть всегда
+
+	// Регистрация handlers
+	handler.NewAuthHandlers(r, authMiddleware, authService, appLogger)
+
+	// HTTP сервер
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%s", cfg.Server.Port),
+		Handler:      r,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
+	}
 
 	// Установим уровень логирования из конфигурации после старта сервера
 	appLogger.SetLevel(cfg.Logger.Level)
+
+	if err := srv.ListenAndServe(); err != nil {
+		panic(fmt.Sprintf("Сервер не запущен: %v", err))
+	}
 }

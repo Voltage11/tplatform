@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Voltage11/tplatform/internal/appcontext"
 	"github.com/Voltage11/tplatform/internal/cache"
 	"github.com/Voltage11/tplatform/internal/config"
 	"github.com/Voltage11/tplatform/internal/domain"
@@ -172,6 +173,13 @@ func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*d
 }
 
 func (u *userService) CheckOrCreateAdmin(ctx context.Context, adminCfg config.AdminConfig) error {
+	
+	userToCtx := domain.User{
+		IsAdmin: true,
+	}
+	ctx = appcontext.SetUserToContext(ctx, &userToCtx)
+	
+	
 	user, err := u.repo.GetByEmail(ctx, adminCfg.Email)
 	if err != nil {
 		if apperror.GetType(err) != apperror.ErrNotFound {

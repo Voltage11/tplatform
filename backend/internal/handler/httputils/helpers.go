@@ -13,10 +13,15 @@ import (
 )
 
 // WriteJSON отправляет JSON-ответ с заданным статусом
-func WriteJSON(w http.ResponseWriter, status int, data interface{}) {
+func WriteJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+// WriteOk успешный ответ
+func WriteOk(w http.ResponseWriter, data any) {
+	WriteJSON(w, http.StatusOK, data)
 }
 
 // WriteErrorString отправляет ошибку в формате JSON
@@ -26,21 +31,21 @@ func WriteErrorString(w http.ResponseWriter, code int, message string) {
 
 // WriteError отправляет ошибку в формате JSON
 func WriteError(w http.ResponseWriter, err error) {
-    var code int
-    var message string
-    
-    if validationErrs, ok := err.(validator.ValidationErrors); ok {
-        code = http.StatusBadRequest
-        message = validationErrs.Error()
-    } else if appErr, ok := err.(*apperror.AppError); ok {
-        code = apperror.HTTPStatusFromError(appErr)
-        message = appErr.Message
-    } else {
-        code = http.StatusInternalServerError
-        message = err.Error()
-    }
-    
-    WriteJSON(w, code, map[string]string{"error": message})
+	var code int
+	var message string
+
+	if validationErrs, ok := err.(validator.ValidationErrors); ok {
+		code = http.StatusBadRequest
+		message = validationErrs.Error()
+	} else if appErr, ok := err.(*apperror.AppError); ok {
+		code = apperror.HTTPStatusFromError(appErr)
+		message = appErr.Message
+	} else {
+		code = http.StatusInternalServerError
+		message = err.Error()
+	}
+
+	WriteJSON(w, code, map[string]string{"error": message})
 }
 
 // ParseUUID извлекает и валидирует UUID из параметра URL
@@ -51,8 +56,16 @@ func ParseUUID(r *http.Request, paramName string) (uuid.UUID, error) {
 
 // ParsePagination извлекает page и limit из query-параметров
 func ParsePagination(r *http.Request) domain.PaginationRequest {
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil {
+		page = 1
+	}
+
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil {
+		limit = 100
+	}
+
 	if page < 1 {
 		page = 1
 	}
