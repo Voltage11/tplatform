@@ -70,4 +70,5 @@ type UserService interface {
 	GetByEmail(ctx context.Context, email string) (*User, error)
 	GetByEmailWithDetail(ctx context.Context, email string) (*UserWithDetail, error)
 	CheckOrCreateAdmin(ctx context.Context, adminCfg config.AdminConfig) error
+	Shutdown()
 }

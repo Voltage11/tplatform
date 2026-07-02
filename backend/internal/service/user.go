@@ -224,3 +224,7 @@ func (u *userService) CheckOrCreateAdmin(ctx context.Context, adminCfg config.Ad
 
 	return nil
 }
+
+func (u *userService) Shutdown() {
+    u.cache.Stop()
+}
