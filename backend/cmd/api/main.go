@@ -99,6 +99,7 @@ func main() {
     r.Use(authMiddleware.ExtractUser)
 
     handler.NewAuthHandlers(r, authMiddleware, authService, appLogger)
+    handler.NewDepartmentHandler(r, authMiddleware, departmentService)
 
     // HTTP-сервер
     srv := &http.Server{
@@ -131,7 +132,7 @@ func main() {
     select {
     case err := <-serverErr:
         appLogger.Error("Критическая ошибка сервера", "error", err)
-        // не вызываем os.Exit, дадим defer'ам отработать
+        // не вызываем os.Exit, дадим defer отработать
         // но завершим программу с ненулевым кодом
         log.Fatalf("Сервер упал: %v", err)
 

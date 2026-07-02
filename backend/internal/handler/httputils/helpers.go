@@ -77,3 +77,28 @@ func ParsePagination(r *http.Request) domain.PaginationRequest {
 	}
 	return domain.PaginationRequest{Page: page, Limit: limit}
 }
+
+func GetQueryValue(r *http.Request, key string) (string, bool) {	
+	ok := r.URL.Query().Has(key)
+
+	if !ok {
+		return "", false
+	}
+
+	return r.URL.Query().Get(key), true
+}
+
+func GetQueryValueInt(r *http.Request, key string) (int, bool) {
+	valueStr, ok := GetQueryValue(r, key)
+
+	if !ok {
+		return 0, false
+	}
+
+	valueInt, err := strconv.Atoi(valueStr)
+	if err != nil {
+		return 0, false
+	}
+
+	return valueInt, true
+}

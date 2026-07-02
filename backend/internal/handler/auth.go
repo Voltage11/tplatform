@@ -13,14 +13,14 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-type AuthHandler struct {
+type authHandler struct {
 	authService *service.AuthService
 	logger      logger.Logger
 	validate    *validator.Validate
 }
 
 func NewAuthHandlers(r chi.Router, authMW *middleware.AuthMiddleware, authService *service.AuthService, log logger.Logger) {
-	h := AuthHandler{
+	h := authHandler{
 		authService: authService,
 		logger:      log,
 		validate:    validator.New(),
@@ -38,7 +38,7 @@ func NewAuthHandlers(r chi.Router, authMW *middleware.AuthMiddleware, authServic
 	})
 }
 
-func (a *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+func (a *authHandler) Login(w http.ResponseWriter, r *http.Request) {
 	loginRequest, err := httputils.DecodeJSONBodyWithValidate[dto.LoginRequest](r, a.validate)
 
 	if err != nil {
@@ -59,7 +59,7 @@ func (a *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+func (a *authHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	refreshRequest, err := httputils.DecodeJSONBodyWithValidate[dto.RefreshRequest](r, a.validate)
 	if err != nil {
 		httputils.WriteError(w, err)
@@ -79,7 +79,7 @@ func (a *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+func (a *authHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	logoutRequest, err := httputils.DecodeJSONBodyWithValidate[dto.LogoutRequest](r, a.validate)
 	if err != nil {
 		httputils.WriteError(w, err)
@@ -95,7 +95,7 @@ func (a *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 // Profile возвращает информацию о текущем пользователе
-func (a *AuthHandler) Profile(w http.ResponseWriter, r *http.Request) {
+func (a *authHandler) Profile(w http.ResponseWriter, r *http.Request) {
 	user := appcontext.GetUserFromContext(r.Context())
 	if user == nil {
 		httputils.WriteErrorString(w, http.StatusUnauthorized, "пользователь не авторизован")
