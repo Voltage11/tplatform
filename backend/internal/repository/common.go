@@ -32,6 +32,10 @@ func getList[T any](
     }
 
     if total == 0 {
+        // Явно завершаем транзакцию перед возвратом
+        if err := tx.Commit(ctx); err != nil {
+            return nil, 0, apperror.NewPostgresError(err)
+        }
         return []T{}, 0, nil
     }
 

@@ -1,5 +1,5 @@
+DROP TABLE IF EXISTS role_permissions;
+DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS users;
 DROP TABLE IF EXISTS departmens;
-DROP TABLE IF EXISTS sessions;
-DROP TABLE IF EXISTS role_permissions;
 DROP TABLE IF EXISTS roles;

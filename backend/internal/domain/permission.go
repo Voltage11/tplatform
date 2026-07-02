@@ -40,7 +40,7 @@ type PermissionEntity struct {
 var (
 	EntityDepartments = PermissionEntity{Name: "departments", Description: "Отделы"}
 	EntityUsers       = PermissionEntity{Name: "users", Description: "Пользователи"}
-	EntityRoles       = PermissionEntity{Name: "roless", Description: "Роли"}
+	EntityRoles       = PermissionEntity{Name: "roles", Description: "Роли"}
 )
 
 // PermissionEntityWithActions — сущность с набором возможных действий
@@ -60,6 +60,10 @@ func GetPermissionsEntitiesWithActions() []PermissionEntityWithActions {
 			Entity:  EntityUsers,
 			Actions: []PermissionAction{ActionView, ActionCreate, ActionUpdate, ActionSoftDelete, ActionHardDelete},
 		},
+		{
+            Entity:  EntityRoles,
+            Actions: []PermissionAction{ActionView, ActionCreate, ActionUpdate, ActionHardDelete},
+        },
 	}
 }
 

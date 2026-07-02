@@ -9,6 +9,7 @@ import (
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
 	"github.com/Voltage11/tplatform/pkg/hash"
+	"github.com/Voltage11/tplatform/pkg/password"
 	jwtpkg "github.com/Voltage11/tplatform/pkg/jwt"
 )
 
@@ -39,14 +40,14 @@ func NewAuthService(
 }
 
 // Login проверяет email/пароль, создаёт сессию и возвращает токены
-func (a *AuthService) Login(ctx context.Context, email, password, userAgent, clientIP string) (*TokenPair, error) {
+func (a *AuthService) Login(ctx context.Context, email, pass, userAgent, clientIP string) (*TokenPair, error) {
 	// 1. Найти пользователя по email
 	user, err := a.userRepo.GetByEmail(ctx, email)
 	if err != nil {
 		return nil, apperror.NewUnauthorized("неверный email или пароль", nil)
 	}
 	// 2. Проверить пароль
-	if !hash.IsValidHash(user.PasswordHash, password) {
+	if !password.Verify(user.PasswordHash, pass) {
 		return nil, apperror.NewUnauthorized("неверный email или пароль", nil)
 	}
 	// 3. Проверить активен ли пользователь
@@ -107,8 +108,16 @@ func (a *AuthService) Refresh(ctx context.Context, refreshToken string) (*TokenP
 		return nil, apperror.NewUnauthorized("сессия отозвана", nil)
 	}
 	if time.Now().UTC().After(session.ExpiresAt) {
-		return nil, apperror.NewUnauthorized("refresh токен истёк", nil)
+		return nil, apperror.NewUnauthorized("refresh токен истёк", nil)		
 	}
+
+	user, err := a.userRepo.GetByID(ctx, session.UserID)
+    if err != nil {
+        return nil, apperror.NewUnauthorized("пользователь не найден", err)
+    }
+    if !user.IsActive {
+        return nil, apperror.NewForbidden("учётная запись деактивирована", nil)
+    }
 
 	// Генерируем новый refresh
 	newRefreshToken, err := a.jwt.GenerateRefreshToken()

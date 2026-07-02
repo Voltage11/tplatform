@@ -92,7 +92,7 @@ func main() {
 	r.Use(middleware.Timeout(cfg.Server.ReadTimeout))
 
 	// Кастомные наши middleware
-	authMiddleware := authmw.NewAuthMiddleware(authService, userService)
+	authMiddleware := authmw.NewAuthMiddleware(authService, userService, appLogger)
 	r.Use(authMiddleware.ExtractUser) // Прокидывание пользователя, если есть всегда
 
 	// Регистрация handlers

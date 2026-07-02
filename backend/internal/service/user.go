@@ -10,7 +10,7 @@ import (
 	"github.com/Voltage11/tplatform/internal/config"
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
-	"github.com/Voltage11/tplatform/pkg/hash"
+	"github.com/Voltage11/tplatform/pkg/password"
 	"github.com/google/uuid"
 )
 
@@ -21,23 +21,27 @@ const (
 type userService struct {
 	repo  domain.UserRepository
 	cache cache.UserCache
-	permissionServise domain.PermissionService
+	permisionServise domain.PermissionService
 }
 
-func NewUserService(repo domain.UserRepository, permissionServise domain.PermissionService) domain.UserService {
+func NewUserService(repo domain.UserRepository, permisionServise domain.PermissionService) domain.UserService {
 	return &userService{
 		repo:  repo,
 		cache: cache.NewUserCache(userCacheDuration),
-		permissionServise: permissionServise,
+		permisionServise: permisionServise,
 	}
 }
 
 func (u *userService) Create(ctx context.Context, user *domain.User) error {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionCreate.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionCreate.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
 
-	user.PasswordHash = hash.ToHash(user.PasswordHash)
+	hashed, err := password.Hash(user.PasswordHash)
+	if err != nil {
+		return fmt.Errorf("ошибка хеширования пароля: %w", err)
+	}
+	user.PasswordHash = hashed
 
 	if err := u.repo.Create(ctx, user); err != nil {
 		return err
@@ -48,7 +52,7 @@ func (u *userService) Create(ctx context.Context, user *domain.User) error {
 }
 
 func (u *userService) Update(ctx context.Context, user *domain.User) error {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -61,7 +65,7 @@ func (u *userService) Update(ctx context.Context, user *domain.User) error {
 }
 
 func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -74,7 +78,7 @@ func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bo
 }
 
 func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionHardDelete.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionHardDelete.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -87,7 +91,7 @@ func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionSoftDelete.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionSoftDelete.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -100,7 +104,7 @@ func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -119,7 +123,7 @@ func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, 
 }
 
 func (u *userService) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.UserWithDetail, error) {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -127,7 +131,7 @@ func (u *userService) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*dom
 }
 
 func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -146,7 +150,7 @@ func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.Use
 }
 
 func (u *userService) GetByEmailWithDetail(ctx context.Context, email string) (*domain.UserWithDetail, error) {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
 	
@@ -154,7 +158,7 @@ func (u *userService) GetByEmailWithDetail(ctx context.Context, email string) (*
 }
 
 func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*domain.PagedResult[*domain.UserWithDetail], error) {
-	if ! u.permissionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
 

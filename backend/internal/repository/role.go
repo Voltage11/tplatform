@@ -68,11 +68,11 @@ func (r *roleRepository) GetList(ctx context.Context, filter domain.RoleFilter) 
 	sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
 
 	sbFilter.Select("id", "name", "description", "created_at").
-		From("roles").
-		Where(sbFilter.IsNull("deleted_at"))
+		From("roles")
+		// Where(sbFilter.IsNull("deleted_at"))
 
-	sbCount.Select("COUNT(*)").From("roles").
-		Where(sbCount.IsNull("deleted_at"))
+	sbCount.Select("COUNT(*)").From("roles")
+		// Where(sbCount.IsNull("deleted_at"))
 
 	if filter.Name != "" {
 		pattern := "%" + filter.Name + "%"

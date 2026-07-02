@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -40,8 +41,14 @@ type DatabaseConfig struct {
 }
 
 func (c *DatabaseConfig) DSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
-		c.User, c.Password, c.Host, c.Port, c.DBName, c.SSLMode)
+    u := url.URL{
+        Scheme: "postgres",
+        User:   url.UserPassword(c.User, c.Password),
+        Host:   fmt.Sprintf("%s:%s", c.Host, c.Port),
+        Path:   c.DBName,
+        RawQuery: url.Values{"sslmode": {c.SSLMode}}.Encode(),
+    }
+    return u.String()
 }
 
 // Validate проверяет корректность конфигурации БД
