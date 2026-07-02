@@ -106,7 +106,6 @@ func (s *permissionService) Can(ctx context.Context, user *domain.User, entityNa
 // CanFromCtx оптимизировал получение прав, пользователя берем из контекста
 func (s *permissionService) CanFromCtx(ctx context.Context, entityName, actionName string) bool {
 	user := appcontext.GetUserFromContext(ctx)
-
 	return s.Can(ctx, user, entityName, actionName)
 }
 

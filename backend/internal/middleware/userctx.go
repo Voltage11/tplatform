@@ -33,12 +33,11 @@ func NewAuthMiddleware(validator TokenValidator, userService domain.UserService,
 
 func (u *AuthMiddleware) ExtractUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
+		authHeader := r.Header.Get("Authorization")		
 		if authHeader == "" {
 			next.ServeHTTP(w, r)
 			return
-		}
-
+		}		
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
 			next.ServeHTTP(w, r)
@@ -46,7 +45,7 @@ func (u *AuthMiddleware) ExtractUser(next http.Handler) http.Handler {
 		}
 
 		token := parts[1]
-
+		
 		userID, err := u.validator.ValidateAccessToken(token)
 		if err != nil {
 			// Логируем причину

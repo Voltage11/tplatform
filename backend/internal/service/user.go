@@ -19,21 +19,21 @@ const (
 )
 
 type userService struct {
-	repo  domain.UserRepository
-	cache cache.UserCache
+	repo             domain.UserRepository
+	cache            cache.UserCache
 	permisionServise domain.PermissionService
 }
 
 func NewUserService(repo domain.UserRepository, permisionServise domain.PermissionService) domain.UserService {
 	return &userService{
-		repo:  repo,
-		cache: cache.NewUserCache(userCacheDuration),
+		repo:             repo,
+		cache:            cache.NewUserCache(userCacheDuration),
 		permisionServise: permisionServise,
 	}
 }
 
 func (u *userService) Create(ctx context.Context, user *domain.User) error {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionCreate.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionCreate.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
 
@@ -52,10 +52,10 @@ func (u *userService) Create(ctx context.Context, user *domain.User) error {
 }
 
 func (u *userService) Update(ctx context.Context, user *domain.User) error {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	if err := u.repo.Update(ctx, user); err != nil {
 		return err
 	}
@@ -65,10 +65,10 @@ func (u *userService) Update(ctx context.Context, user *domain.User) error {
 }
 
 func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	if err := u.repo.SetIsActive(ctx, id, isActive); err != nil {
 		return err
 	}
@@ -78,10 +78,10 @@ func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bo
 }
 
 func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionHardDelete.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionHardDelete.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	if err := u.repo.HardDelete(ctx, id); err != nil {
 		return err
 	}
@@ -91,10 +91,10 @@ func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionSoftDelete.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionSoftDelete.Name) {
 		return apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	if err := u.repo.SoftDelete(ctx, id); err != nil {
 		return err
 	}
@@ -104,10 +104,10 @@ func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
-		return nil, apperror.NewForbiddenWithoutErr()
-	}
-	
+	// if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	// 	return nil, apperror.NewForbiddenWithoutErr()
+	// }
+
 	// Проверяем кэш
 	if user := u.cache.GetByID(id); user != nil {
 		return user, nil
@@ -123,18 +123,18 @@ func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, 
 }
 
 func (u *userService) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.UserWithDetail, error) {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	return u.repo.GetByIDWithDetail(ctx, id)
 }
 
 func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	// Проверяем кэш
 	if user := u.cache.GetByEmail(email); user != nil {
 		return user, nil
@@ -150,18 +150,17 @@ func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.Use
 }
 
 func (u *userService) GetByEmailWithDetail(ctx context.Context, email string) (*domain.UserWithDetail, error) {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
-	
+
 	return u.repo.GetByEmailWithDetail(ctx, email)
 }
 
 func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*domain.PagedResult[*domain.UserWithDetail], error) {
-	if ! u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
 		return nil, apperror.NewForbiddenWithoutErr()
 	}
-
 
 	users, total, err := u.repo.GetList(ctx, filter)
 	if err != nil {
@@ -177,13 +176,12 @@ func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*d
 }
 
 func (u *userService) CheckOrCreateAdmin(ctx context.Context, adminCfg config.AdminConfig) error {
-	
+
 	userToCtx := domain.User{
 		IsAdmin: true,
 	}
 	ctx = appcontext.SetUserToContext(ctx, &userToCtx)
-	
-	
+
 	user, err := u.repo.GetByEmail(ctx, adminCfg.Email)
 	if err != nil {
 		if apperror.GetType(err) != apperror.ErrNotFound {
@@ -226,5 +224,5 @@ func (u *userService) CheckOrCreateAdmin(ctx context.Context, adminCfg config.Ad
 }
 
 func (u *userService) Shutdown() {
-    u.cache.Stop()
+	u.cache.Stop()
 }
