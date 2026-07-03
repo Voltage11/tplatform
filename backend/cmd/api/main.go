@@ -95,9 +95,10 @@ func main() {
 	authMiddleware := authmw.NewAuthMiddleware(authService, userService, appLogger)
 	r.Use(authMiddleware.ExtractUser)
 
-	handler.NewAuthHandlers(r, authMiddleware, authService, appLogger)
+	handler.NewAuthHandlers(r, authMiddleware, authService, userService, appLogger)
 	handler.NewDepartmentHandler(r, authMiddleware, departmentService)
 	handler.NewRoleHandler(r, authMiddleware, roleService)
+	handler.NewUserHandler(r, authMiddleware, userService)
 
 	// HTTP-сервер
 	srv := &http.Server{

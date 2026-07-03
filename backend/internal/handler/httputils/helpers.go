@@ -7,6 +7,7 @@ import (
 
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/Voltage11/tplatform/internal/types/filterbool"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -78,7 +79,11 @@ func ParsePagination(r *http.Request) domain.PaginationRequest {
 	return domain.PaginationRequest{Page: page, Limit: limit}
 }
 
-func GetQueryValue(r *http.Request, key string) (string, bool) {	
+func GetQueryValue(r *http.Request, key string) string {
+	return r.URL.Query().Get(key)
+}
+
+func GetQueryValueWithExist(r *http.Request, key string) (string, bool) {
 	ok := r.URL.Query().Has(key)
 
 	if !ok {
@@ -89,7 +94,7 @@ func GetQueryValue(r *http.Request, key string) (string, bool) {
 }
 
 func GetQueryValueInt(r *http.Request, key string) (int, bool) {
-	valueStr, ok := GetQueryValue(r, key)
+	valueStr, ok := GetQueryValueWithExist(r, key)
 
 	if !ok {
 		return 0, false
@@ -101,4 +106,31 @@ func GetQueryValueInt(r *http.Request, key string) (int, bool) {
 	}
 
 	return valueInt, true
+}
+
+func ParseFilterBool(r *http.Request, key string) filterbool.FilterBool {
+	val, ok := GetQueryValueWithExist(r, key)
+	if !ok {
+		return filterbool.FilterBoolAll
+	}
+	switch val {
+	case "true":
+		return filterbool.FilterBoolTrue
+	case "false":
+		return filterbool.FilterBoolFalse
+	default:
+		return filterbool.FilterBoolAll
+	}
+}
+
+func ParseUUIDQuery(r *http.Request, key string) *uuid.UUID {
+	val, ok := GetQueryValueWithExist(r, key)
+	if !ok || val == "" {
+		return nil
+	}
+	id, err := uuid.Parse(val)
+	if err != nil {
+		return nil
+	}
+	return &id
 }

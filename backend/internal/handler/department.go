@@ -42,7 +42,7 @@ func (d *departmentHandler) GetList(w http.ResponseWriter, r *http.Request) {
 	paginationRequest := httputils.ParsePagination(r)
 
 	// Получаем значение и проверяем, что оно не пустое
-	nameFilter, ok := httputils.GetQueryValue(r, "name")
+	nameFilter, ok := httputils.GetQueryValueWithExist(r, "name")
 	if ok && nameFilter == "" {
 		nameFilter = ""
 	} else if !ok {

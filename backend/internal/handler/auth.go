@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/Voltage11/tplatform/internal/appcontext"
+	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/handler/dto"
 	"github.com/Voltage11/tplatform/internal/handler/httputils"
 	"github.com/Voltage11/tplatform/internal/middleware"
@@ -15,13 +16,15 @@ import (
 
 type authHandler struct {
 	authService *service.AuthService
+	userService domain.UserService
 	logger      logger.Logger
 	validate    *validator.Validate
 }
 
-func NewAuthHandlers(r chi.Router, authMW *middleware.AuthMiddleware, authService *service.AuthService, log logger.Logger) {
+func NewAuthHandlers(r chi.Router, authMW *middleware.AuthMiddleware, authService *service.AuthService, userService domain.UserService, log logger.Logger) {
 	h := authHandler{
 		authService: authService,
+		userService: userService,
 		logger:      log,
 		validate:    validator.New(),
 	}
@@ -102,7 +105,13 @@ func (a *authHandler) Profile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userWithDetail, err := a.userService.GetByIDWithDetail(r.Context(), user.ID)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
 	httputils.WriteJSON(w, http.StatusOK, map[string]any{
-		"user": dto.UserToResponse(user),
+		"user": dto.UserToResponse(userWithDetail),
 	})
 }

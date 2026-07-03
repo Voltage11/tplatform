@@ -1,14 +1,14 @@
 package handler
 
 import (
-    "net/http"
+	"net/http"
 
-    "github.com/Voltage11/tplatform/internal/domain"
-    "github.com/Voltage11/tplatform/internal/handler/dto"
-    "github.com/Voltage11/tplatform/internal/handler/httputils"
-    "github.com/Voltage11/tplatform/internal/middleware"
-    "github.com/go-chi/chi/v5"
-    "github.com/go-playground/validator/v10"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
 )
 
 type roleHandler struct {
@@ -100,7 +100,7 @@ func (h *roleHandler) GetList(w http.ResponseWriter, r *http.Request) {
     paginationRequest := httputils.ParsePagination(r)
 
     // Безопасное получение фильтра по имени
-    nameFilter, ok := httputils.GetQueryValue(r, "name")
+    nameFilter, ok := httputils.GetQueryValueWithExist(r, "name")
     if ok && nameFilter == "" {
         nameFilter = "" // игнорируем пустой параметр
     } else if !ok {

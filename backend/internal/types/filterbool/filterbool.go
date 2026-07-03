@@ -51,3 +51,4 @@ func NewFilterBool(s string) FilterBool {
 		return FilterBoolAll
 	}
 }
+
