@@ -103,6 +103,6 @@ func (a *authHandler) Profile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httputils.WriteJSON(w, http.StatusOK, map[string]any{
-		"user": dto.NewUserResponse(user),
+		"user": dto.UserToResponse(user),
 	})
 }

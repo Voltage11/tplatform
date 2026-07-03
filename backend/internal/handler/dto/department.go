@@ -21,7 +21,7 @@ type DepartmentResponse struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-func NewDepartmentToResponse(department *domain.Department) *DepartmentResponse {
+func DepartmentToResponse(department *domain.Department) *DepartmentResponse {
 	return &DepartmentResponse{
 		ID:        department.ID.String(),
 		Name:      department.Name,
@@ -30,14 +30,14 @@ func NewDepartmentToResponse(department *domain.Department) *DepartmentResponse 
 	}
 }
 
-func NewDepartmentsToResponse(departments []*domain.Department) []*DepartmentResponse {
+func DepartmentsToResponseSlice(departments []*domain.Department) []*DepartmentResponse {
 	if departments == nil {
 		return nil
 	}
 
 	out := make([]*DepartmentResponse, len(departments))
 	for i, department := range departments {
-		out[i] = NewDepartmentToResponse(department)
+		out[i] = DepartmentToResponse(department)
 	}
 	return out
 }

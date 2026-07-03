@@ -10,18 +10,14 @@ type UserResponse struct {
 	Email        string              `json:"email"`
 	IsActive     bool                `json:"is_active"`
 	IsAdmin      bool                `json:"is_admin"`
-	// Department   *DepartmentResponse `json:"department,omitempty"`
-	// Role         *RoleResponse       `json:"role,omitempty"`      
+	Department   *DepartmentResponse `json:"department,omitempty"`
+	Role         *RoleResponse       `json:"role,omitempty"`      
 	CreatedAt    string              `json:"created_at,omitempty"`
 	UpdatedAt    string              `json:"updated_at,omitempty"`
 }
 
-// type RoleResponse struct {
-// 	ID   string `json:"id"`
-// 	Name string `json:"name"`
-// }
 
-func NewUserResponse(user *domain.User) *UserResponse {
+func UserToResponse(user *domain.User) *UserResponse {
 	if user == nil {
 		return nil
 	}

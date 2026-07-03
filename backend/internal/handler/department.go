@@ -34,7 +34,7 @@ func NewDepartmentHandler(r chi.Router, authMW *middleware.AuthMiddleware, depar
 
 	r.Group(func(r chi.Router) {
 		r.Use(authMW.RequireAuth, authMW.RequireAdmin)
-		r.Delete("/api/v1/departments/{id}/permanent", h.HardDelete)
+		r.Delete("/api/v1/departments/{id}/hard", h.HardDelete)
 	})
 }
 
@@ -59,7 +59,7 @@ func (d *departmentHandler) GetList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Преобразуем домен в DTO
-	deptDTOs := dto.NewDepartmentsToResponse(departments.Data)
+	deptDTOs := dto.DepartmentsToResponseSlice(departments.Data)
 	response := dto.NewPagedResponse(deptDTOs, departments.Pagination)
 
 	httputils.WriteOk(w, response)
@@ -78,7 +78,7 @@ func (d *departmentHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputils.WriteOk(w, dto.NewDepartmentToResponse(department))
+	httputils.WriteOk(w, dto.DepartmentToResponse(department))
 }
 
 func (d *departmentHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +97,7 @@ func (d *departmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputils.WriteOk(w, dto.NewDepartmentToResponse(&department))
+	httputils.WriteOk(w, dto.DepartmentToResponse(&department))
 }
 
 func (d *departmentHandler) Update(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +126,7 @@ func (d *departmentHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputils.WriteOk(w, dto.NewDepartmentToResponse(department))
+	httputils.WriteOk(w, dto.DepartmentToResponse(department))
 }
 
 func (d *departmentHandler) HardDelete(w http.ResponseWriter, r *http.Request) {
