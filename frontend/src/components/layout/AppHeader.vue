@@ -18,7 +18,7 @@ async function handleLogout() {
       <nav class="nav-links">
         <!-- Заглушки разделов (позже заменим на router-link) -->
         <router-link to="#" class="nav-link">Тесты</router-link>
-        <router-link to="#" class="nav-link">Пользователи</router-link>
+        <router-link to="/users" class="nav-link">Пользователи</router-link>
         <router-link to="/departments" class="nav-link">Отделы</router-link>
         <router-link to="/roles" class="nav-link">Роли</router-link>
       </nav>
