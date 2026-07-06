@@ -60,3 +60,9 @@ func (r *permissionsRepository) GetRolePermissions(ctx context.Context, roleID u
 	}
 	return perms, rows.Err()
 }
+
+func (r *permissionsRepository) ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error {
+	query := `DELETE FROM role_permissions WHERE role_id = $1`
+	_, err := r.pool.Exec(ctx, query, roleID)
+	return apperror.NewPostgresError(err)
+}

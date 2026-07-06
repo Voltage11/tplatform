@@ -99,6 +99,7 @@ func main() {
 	handler.NewDepartmentHandler(r, authMiddleware, departmentService)
 	handler.NewRoleHandler(r, authMiddleware, roleService)
 	handler.NewUserHandler(r, authMiddleware, userService)
+	handler.NewPermissionHandler(r, authMiddleware, permissionService)
 
 	// HTTP-сервер
 	srv := &http.Server{

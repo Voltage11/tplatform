@@ -28,7 +28,6 @@ func NewPermissionService(repo domain.PermissionsRepository) domain.PermissionSe
 		cachedAt: make(map[uuid.UUID]time.Time),
 		stopCh:   make(chan struct{}),
 	}
-	// горутина очистки просроченного кэша
 	go s.startCleaner()
 	return s
 }
@@ -80,7 +79,6 @@ func (s *permissionService) Can(ctx context.Context, user *domain.User, entityNa
 	if user == nil {
 		return false
 	}
-
 	if user.IsAdmin {
 		return true
 	}
@@ -103,16 +101,29 @@ func (s *permissionService) Can(ctx context.Context, user *domain.User, entityNa
 	return false
 }
 
-// CanFromCtx оптимизировал получение прав, пользователя берем из контекста
 func (s *permissionService) CanFromCtx(ctx context.Context, entityName, actionName string) bool {
 	user := appcontext.GetUserFromContext(ctx)
 	return s.Can(ctx, user, entityName, actionName)
 }
 
+func (s *permissionService) ReplacePermissions(ctx context.Context, roleID uuid.UUID, targets []domain.PermissionTarget) error {
+	// очищаем текущие права
+	if err := s.repo.ClearRolePermissions(ctx, roleID); err != nil {
+		return err
+	}
+	// добавляем новые
+	for _, t := range targets {
+		if err := s.repo.SetAction(ctx, roleID, t.EntityName, t.ActionName); err != nil {
+			return err
+		}
+	}
+	s.invalidate(roleID)
+	return nil
+}
+
 // --- кэш ---
 
 func (s *permissionService) getCached(roleID uuid.UUID, loader func() ([]domain.RolePermission, error)) ([]domain.RolePermission, error) {
-	// быстрое чтение
 	s.cacheMu.RLock()
 	if cachedAt, ok := s.cachedAt[roleID]; ok && time.Since(cachedAt) < s.cacheTTL {
 		val := s.cache[roleID]
@@ -121,7 +132,6 @@ func (s *permissionService) getCached(roleID uuid.UUID, loader func() ([]domain.
 	}
 	s.cacheMu.RUnlock()
 
-	// загрузка под write-lock
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 
@@ -171,7 +181,6 @@ func (s *permissionService) clearExpired() {
 	}
 }
 
-// Shutdown вызывается при остановке приложения
 func (s *permissionService) Shutdown() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
