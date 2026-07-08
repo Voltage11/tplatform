@@ -22,13 +22,15 @@ type userService struct {
 	repo             domain.UserRepository
 	cache            cache.UserCache
 	permisionServise domain.PermissionService
+	txManager        domain.Transactor
 }
 
-func NewUserService(repo domain.UserRepository, permisionServise domain.PermissionService) domain.UserService {
+func NewUserService(repo domain.UserRepository, permisionServise domain.PermissionService, txManager domain.Transactor) domain.UserService {
 	return &userService{
 		repo:             repo,
 		cache:            cache.NewUserCache(userCacheDuration),
 		permisionServise: permisionServise,
+		txManager:        txManager,
 	}
 }
 
@@ -177,50 +179,62 @@ func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*d
 
 func (u *userService) CheckOrCreateAdmin(ctx context.Context, adminCfg config.AdminConfig) error {
 
-	userToCtx := domain.User{
-		IsAdmin: true,
-	}
+	userToCtx := domain.User{IsAdmin: true}
 	ctx = appcontext.SetUserToContext(ctx, &userToCtx)
 
-	user, err := u.repo.GetByEmail(ctx, adminCfg.Email)
-	if err != nil {
-		if apperror.GetType(err) != apperror.ErrNotFound {
-			return fmt.Errorf("ошибка при поиске администратора: %w", err)
+	// Оборачиваем всю операцию проверки и создания/обновления в транзакцию
+	return u.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
+		// 1. Ищем админа внутри транзакции
+		user, err := u.repo.GetByEmail(txCtx, adminCfg.Email)
+		if err != nil {
+			if apperror.GetType(err) != apperror.ErrNotFound {
+				return fmt.Errorf("ошибка при поиске администратора: %w", err)
+			}
+			user = nil
 		}
-		// пользователь не найден — значит, создадим нового
-		user = nil
-	}
 
-	// 1. Если пользователь уже существует
-	if user != nil {
-		// Уже активный админ — ничего не делаем
-		if user.IsActive && user.IsAdmin {
+		// 2. Если админ найден, при необходимости обновляем его статус
+		if user != nil {
+			if user.IsActive && user.IsAdmin {
+				return nil
+			}
+
+			user.IsActive = true
+			user.IsAdmin = true
+			// Вызываем метод репозитория напрямую с txCtx
+			if err := u.repo.Update(txCtx, user); err != nil {
+				return fmt.Errorf("не удалось обновить администратора: %w", err)
+			}
+			// Кэш обновляем внутри замыкания, он применится только если Commit пройдет успешно
+			u.cache.Set(user)
 			return nil
 		}
 
-		// Иначе обновляем: делаем активным и админом, не трогая пароль и остальные данные
-		user.IsActive = true
-		user.IsAdmin = true
-		if err := u.Update(ctx, user); err != nil {
-			return fmt.Errorf("не удалось обновить администратора: %w", err)
+		// 3. Если админа нет — создаём нового
+		createdUser := &domain.User{
+			ID:           uuid.New(),
+			FirstName:    "Админ",
+			LastName:     "Администратор",
+			Email:        adminCfg.Email,
+			PasswordHash: adminCfg.Password,
+			IsActive:     true,
+			IsAdmin:      true,
 		}
+
+		hashed, err := password.Hash(createdUser.PasswordHash)
+		if err != nil {
+			return fmt.Errorf("ошибка хеширования пароля админа: %w", err)
+		}
+		createdUser.PasswordHash = hashed
+
+		// Записываем в БД внутри транзакции
+		if err := u.repo.Create(txCtx, createdUser); err != nil {
+			return fmt.Errorf("не удалось создать администратора: %w", err)
+		}
+
+		u.cache.Set(createdUser)
 		return nil
-	}
-
-	// 2. Пользователя нет — создаём нового администратора
-	createdUser := &domain.User{
-		FirstName:    "Админ",
-		LastName:     "Администратор",
-		Email:        adminCfg.Email,
-		PasswordHash: adminCfg.Password, // пароль будет захэширован внутри Create
-		IsActive:     true,
-		IsAdmin:      true,
-	}
-	if err := u.Create(ctx, createdUser); err != nil {
-		return fmt.Errorf("не удалось создать администратора: %w", err)
-	}
-
-	return nil
+	})
 }
 
 func (u *userService) Shutdown() {

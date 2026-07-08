@@ -4,22 +4,20 @@ import (
 	"context"
 	"time"
 
+	"github.com/Voltage11/tplatform/internal/db"
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
 	"github.com/Voltage11/tplatform/pkg/helpers"
 	"github.com/google/uuid"
 	"github.com/huandu/go-sqlbuilder"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type userRepository struct {
-	pool *pgxpool.Pool
+	db *db.PostgresDB
 }
 
-func NewUserRepository(pool *pgxpool.Pool) domain.UserRepository {
-	return &userRepository{
-		pool: pool,
-	}
+func NewUserRepository(postgresDB *db.PostgresDB) domain.UserRepository {
+	return &userRepository{db: postgresDB}
 }
 
 func (u *userRepository) Create(ctx context.Context, user *domain.User) error {
@@ -32,7 +30,9 @@ func (u *userRepository) Create(ctx context.Context, user *domain.User) error {
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING id`
 
-	if err := u.pool.QueryRow(ctx, query,
+	executor := u.db.GetDB(ctx)
+
+	if err := executor.QueryRow(ctx, query,
 		user.FirstName,
 		user.SecondName,
 		user.LastName,
@@ -59,7 +59,9 @@ func (u *userRepository) Update(ctx context.Context, user *domain.User) error {
         department_id = $5, role_id = $6, is_active = $7, is_admin = $8, updated_at = $9
         WHERE id = $10`
 
-	result, err := u.pool.Exec(ctx, query,
+	executor := u.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query,
 		user.FirstName, user.SecondName, user.LastName, user.Email,
 		user.DepartmentID,
 		user.RoleID,
@@ -79,7 +81,10 @@ func (u *userRepository) Update(ctx context.Context, user *domain.User) error {
 
 func (u *userRepository) SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error {
 	query := `UPDATE users SET is_active = $1 WHERE id = $2 AND deleted_at IS NULL`
-	result, err := u.pool.Exec(ctx, query, isActive, id)
+	
+	executor := u.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query, isActive, id)
 	if err != nil {
 		return apperror.NewPostgresError(err)
 	}
@@ -91,7 +96,9 @@ func (u *userRepository) SetIsActive(ctx context.Context, id uuid.UUID, isActive
 
 func (u *userRepository) HardDelete(ctx context.Context, id uuid.UUID) error {
 	query := `DELETE FROM users WHERE id = $1`
-	result, err := u.pool.Exec(ctx, query, id)
+	
+	executor := u.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, id)
 	if err != nil {
 		return apperror.NewPostgresError(err)
 	}
@@ -104,7 +111,9 @@ func (u *userRepository) HardDelete(ctx context.Context, id uuid.UUID) error {
 func (u *userRepository) SoftDelete(ctx context.Context, id uuid.UUID) error {
 	deletedAt := time.Now().UTC()
 	query := `UPDATE users SET deleted_at = $1 WHERE id = $2 AND deleted_at IS NULL`
-	result, err := u.pool.Exec(ctx, query, deletedAt, id)
+	
+	executor := u.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, deletedAt, id)
 	if err != nil {
 		return apperror.NewPostgresError(err)
 	}
@@ -121,7 +130,10 @@ func (u *userRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Use
 
 	user := &domain.User{}
 	var deptID, roleID uuid.NullUUID
-	err := u.pool.QueryRow(ctx, query, id).Scan(
+
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, id).Scan(
 		&user.ID,
 		&user.FirstName,
 		&user.SecondName,
@@ -161,7 +173,9 @@ func (u *userRepository) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*
 	var deptIDPtr, roleIDPtr *uuid.UUID
 	var deptName, roleName *string
 
-	err := u.pool.QueryRow(ctx, query, id).Scan(
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, id).Scan(
 		&user.ID,
 		&user.FirstName,
 		&user.SecondName,
@@ -210,7 +224,10 @@ func (u *userRepository) GetByEmail(ctx context.Context, email string) (*domain.
 
 	user := &domain.User{}
 	var deptID, roleID uuid.NullUUID
-	err := u.pool.QueryRow(ctx, query, email).Scan(
+
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, email).Scan(
 		&user.ID, &user.FirstName, &user.SecondName, &user.LastName, &user.Email,
 		&user.PasswordHash, &deptID, &roleID, &user.IsActive, &user.IsAdmin,
 		&user.CreatedAt, &user.UpdatedAt, &user.DeletedAt,
@@ -240,7 +257,9 @@ func (u *userRepository) GetByEmailWithDetail(ctx context.Context, email string)
 	var deptIDPtr, roleIDPtr *uuid.UUID
 	var deptName, roleName *string
 
-	err := u.pool.QueryRow(ctx, query, email).Scan(
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, email).Scan(
 		&user.ID,
 		&user.FirstName,
 		&user.SecondName,
@@ -342,7 +361,7 @@ func (u *userRepository) GetList(ctx context.Context, filter domain.UserFilter) 
 		OrderBy("u.last_name")
 
 	// Используем универсальный getList с готовой scanUserRow
-	return getList(ctx, u.pool, sbFilter, sbCount, scanUserRow)
+	return getList(ctx, u.db, sbFilter, sbCount, scanUserRow)
 }
 
 func scanUserRow(scanner rowScanner) (*domain.UserWithDetail, error) {

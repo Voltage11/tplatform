@@ -1,10 +1,11 @@
 package repository
 
 import (
-    "context"
-    "github.com/huandu/go-sqlbuilder"
-    "github.com/jackc/pgx/v5/pgxpool"
-    "github.com/Voltage11/tplatform/internal/types/apperror"
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/huandu/go-sqlbuilder"
 )
 
 type rowScanner interface {
@@ -12,54 +13,44 @@ type rowScanner interface {
 }
 
 func getList[T any](
-    ctx context.Context,
-    pool *pgxpool.Pool,
-    sbFilter, sbCount *sqlbuilder.SelectBuilder,
-    scanRow func(scanner rowScanner) (T, error),
+	ctx context.Context,
+	postgresDB *db.PostgresDB,
+	sbFilter, sbCount *sqlbuilder.SelectBuilder,
+	scanRow func(scanner rowScanner) (T, error),
 ) ([]T, int64, error) {
-    queryFilter, argsFilter := sbFilter.Build()
-    queryCount, argsCount := sbCount.Build()
+	queryFilter, argsFilter := sbFilter.Build()
+	queryCount, argsCount := sbCount.Build()
 
-    tx, err := pool.Begin(ctx)
-    if err != nil {
-        return nil, 0, apperror.NewPostgresError(err)
-    }
-    defer tx.Rollback(ctx)
+	// 2. Автоматически получаем нужный исполнитель (транзакция или пул)
+	executor := postgresDB.GetDB(ctx)
 
-    var total int64
-    if err := tx.QueryRow(ctx, queryCount, argsCount...).Scan(&total); err != nil {
-        return nil, 0, apperror.NewPostgresError(err)
-    }
+	// 3. Выполняем подсчет общего количества
+	var total int64
+	if err := executor.QueryRow(ctx, queryCount, argsCount...).Scan(&total); err != nil {
+		return nil, 0, apperror.NewPostgresError(err)
+	}
 
-    if total == 0 {
-        // Явно завершаем транзакцию перед возвратом
-        if err := tx.Commit(ctx); err != nil {
-            return nil, 0, apperror.NewPostgresError(err)
-        }
-        return []T{}, 0, nil
-    }
+	if total == 0 {
+		return []T{}, 0, nil
+	}
 
-    rows, err := tx.Query(ctx, queryFilter, argsFilter...)
-    if err != nil {
-        return nil, 0, apperror.NewPostgresError(err)
-    }
-    defer rows.Close()
+	// 4. Выполняем фильтрованный запрос списка
+	rows, err := executor.Query(ctx, queryFilter, argsFilter...)
+	if err != nil {
+		return nil, 0, apperror.NewPostgresError(err)
+	}
+	defer rows.Close()
 
-    result := make([]T, 0, total)
-    for rows.Next() {
-        item, err := scanRow(rows)
-        if err != nil {
-            return nil, 0, apperror.NewPostgresError(err)
-        }
-        result = append(result, item)
-    }
-    if err := rows.Err(); err != nil {
-        return nil, 0, apperror.NewPostgresError(err)
-    }
-
-    if err := tx.Commit(ctx); err != nil {
-        return nil, 0, apperror.NewPostgresError(err)
-    }
-
-    return result, total, nil
+	result := make([]T, 0, total)
+	for rows.Next() {
+		item, err := scanRow(rows)
+		if err != nil {
+			return nil, 0, apperror.NewPostgresError(err)
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, apperror.NewPostgresError(err)
+	}
+	return result, total, nil
 }

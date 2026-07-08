@@ -43,7 +43,6 @@ func NewAuthHandlers(r chi.Router, authMW *middleware.AuthMiddleware, authServic
 
 func (a *authHandler) Login(w http.ResponseWriter, r *http.Request) {
 	loginRequest, err := httputils.DecodeJSONBodyWithValidate[dto.LoginRequest](r, a.validate)
-
 	if err != nil {
 		httputils.WriteError(w, err)
 		return

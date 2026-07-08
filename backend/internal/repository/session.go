@@ -3,18 +3,18 @@ package repository
 import (
 	"context"
 
+	"github.com/Voltage11/tplatform/internal/db"
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type sessionRepository struct {
-	pool *pgxpool.Pool
+	db *db.PostgresDB
 }
 
-func NewSessionRepository(pool *pgxpool.Pool) domain.SessionRepository {
-	return &sessionRepository{pool: pool}
+func NewSessionRepository(db *db.PostgresDB) domain.SessionRepository {
+	return &sessionRepository{db: db}
 }
 
 func (r *sessionRepository) Create(ctx context.Context, session *domain.Session) error {
@@ -22,7 +22,9 @@ func (r *sessionRepository) Create(ctx context.Context, session *domain.Session)
         INSERT INTO sessions (id, user_id, refresh_token_hash, expires_at, created_at, user_agent, client_ip)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
     `
-	_, err := r.pool.Exec(ctx, query,
+
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query,
 		session.ID,
 		session.UserID,
 		session.RefreshTokenHash,
@@ -41,7 +43,9 @@ func (r *sessionRepository) GetByRefreshTokenHash(ctx context.Context, hash stri
         WHERE refresh_token_hash = $1
     `
 	var s domain.Session
-	err := r.pool.QueryRow(ctx, query, hash).Scan(
+
+	executor := r.db.GetDB(ctx)
+	err := executor.QueryRow(ctx, query, hash).Scan(
 		&s.ID, &s.UserID, &s.RefreshTokenHash, &s.ExpiresAt, &s.CreatedAt, &s.RevokedAt,
 		&s.UserAgent, &s.ClientIP,
 	)
@@ -53,7 +57,9 @@ func (r *sessionRepository) GetByRefreshTokenHash(ctx context.Context, hash stri
 
 func (r *sessionRepository) Revoke(ctx context.Context, id uuid.UUID) error {
 	query := `UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL`
-	result, err := r.pool.Exec(ctx, query, id)
+
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, id)
 	if err != nil {
 		return apperror.NewPostgresError(err)
 	}
@@ -65,13 +71,17 @@ func (r *sessionRepository) Revoke(ctx context.Context, id uuid.UUID) error {
 
 func (r *sessionRepository) RevokeAllUserSessions(ctx context.Context, userID uuid.UUID) error {
 	query := `UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`
-	_, err := r.pool.Exec(ctx, query, userID)
+
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query, userID)
 	return apperror.NewPostgresError(err)
 }
 
 func (r *sessionRepository) DeleteExpired(ctx context.Context) (int64, error) {
 	query := `DELETE FROM sessions WHERE expires_at < NOW()`
-	result, err := r.pool.Exec(ctx, query)
+
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query)
 	if err != nil {
 		return 0, apperror.NewPostgresError(err)
 	}

@@ -3,18 +3,18 @@ package repository
 import (
 	"context"
 
+	"github.com/Voltage11/tplatform/internal/db"
 	"github.com/Voltage11/tplatform/internal/domain"
 	"github.com/Voltage11/tplatform/internal/types/apperror"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type permissionsRepository struct {
-	pool *pgxpool.Pool
+	db *db.PostgresDB
 }
 
-func NewPermissionsRepository(pool *pgxpool.Pool) domain.PermissionsRepository {
-	return &permissionsRepository{pool: pool}
+func NewPermissionsRepository(db *db.PostgresDB) domain.PermissionsRepository {
+	return &permissionsRepository{db: db}
 }
 
 func (r *permissionsRepository) SetAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error {
@@ -23,7 +23,9 @@ func (r *permissionsRepository) SetAction(ctx context.Context, roleID uuid.UUID,
         VALUES ($1, $2, $3)
         ON CONFLICT DO NOTHING
     `
-	_, err := r.pool.Exec(ctx, query, roleID, entityName, actionName)
+
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query, roleID, entityName, actionName)
 	if err != nil {
 		return apperror.NewPostgresError(err)
 	}
@@ -32,7 +34,9 @@ func (r *permissionsRepository) SetAction(ctx context.Context, roleID uuid.UUID,
 
 func (r *permissionsRepository) RemoveAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error {
 	query := `DELETE FROM role_permissions WHERE role_id = $1 AND entity_name = $2 AND action_name = $3`
-	result, err := r.pool.Exec(ctx, query, roleID, entityName, actionName)
+	
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, roleID, entityName, actionName)
 	if err != nil {
 		return apperror.NewPostgresError(err)
 	}
@@ -44,7 +48,9 @@ func (r *permissionsRepository) RemoveAction(ctx context.Context, roleID uuid.UU
 
 func (r *permissionsRepository) GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]domain.RolePermission, error) {
 	query := `SELECT role_id, entity_name, action_name FROM role_permissions WHERE role_id = $1`
-	rows, err := r.pool.Query(ctx, query, roleID)
+	
+	executor := r.db.GetDB(ctx)
+	rows, err := executor.Query(ctx, query, roleID)
 	if err != nil {
 		return nil, apperror.NewPostgresError(err)
 	}
@@ -63,6 +69,8 @@ func (r *permissionsRepository) GetRolePermissions(ctx context.Context, roleID u
 
 func (r *permissionsRepository) ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error {
 	query := `DELETE FROM role_permissions WHERE role_id = $1`
-	_, err := r.pool.Exec(ctx, query, roleID)
+	
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query, roleID)
 	return apperror.NewPostgresError(err)
 }

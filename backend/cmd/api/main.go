@@ -48,11 +48,11 @@ func main() {
 	appLogger.Info("Подключение к БД успешно")
 
 	// Репозитории
-	sessionRepo := repository.NewSessionRepository(dbPostgres.Pool)
-	permissionRepo := repository.NewPermissionsRepository(dbPostgres.Pool)
-	departmentRepo := repository.NewDepartmentRepository(dbPostgres.Pool)
-	roleRepo := repository.NewRoleRepository(dbPostgres.Pool)
-	userRepo := repository.NewUserRepository(dbPostgres.Pool)
+	sessionRepo := repository.NewSessionRepository(dbPostgres)
+	permissionRepo := repository.NewPermissionsRepository(dbPostgres)
+	departmentRepo := repository.NewDepartmentRepository(dbPostgres)
+	roleRepo := repository.NewRoleRepository(dbPostgres)
+	userRepo := repository.NewUserRepository(dbPostgres)
 
 	// Сервисы
 	jwtCfg := jwt.Config{
@@ -67,7 +67,7 @@ func main() {
 	authService := service.NewAuthService(userRepo, sessionRepo, jwtCfg)
 	departmentService := service.NewDepartmentService(departmentRepo, permissionService)
 	roleService := service.NewRoleService(roleRepo, permissionService)
-	userService := service.NewUserService(userRepo, permissionService)
+	userService := service.NewUserService(userRepo, permissionService, dbPostgres)
 	defer userService.Shutdown() // остановка кэша пользователей
 
 	// Создание / проверка администратора
