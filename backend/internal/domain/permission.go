@@ -2,7 +2,6 @@ package domain
 
 import (
 	"context"
-	
 
 	"github.com/google/uuid"
 )
@@ -39,6 +38,7 @@ var (
 	EntityDepartments = PermissionEntity{Name: "departments", Description: "Отделы"}
 	EntityUsers       = PermissionEntity{Name: "users", Description: "Пользователи"}
 	EntityRoles       = PermissionEntity{Name: "roles", Description: "Роли"}
+	EntityThemes      = PermissionEntity{Name: "themes", Description: "Темы"}
 )
 
 type PermissionEntityWithActions struct {
@@ -81,7 +81,7 @@ type PermissionsRepository interface {
 	SetAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error
 	RemoveAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error
 	GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]RolePermission, error)
-	ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error 
+	ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error
 }
 
 // PermissionService сервис управления правами ролей

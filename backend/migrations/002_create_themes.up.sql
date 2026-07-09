@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS themes (
     max_point INT NOT NULL DEFAULT 0,
     check_point INT NOT NULL DEFAULT 0,
     img_path VARCHAR(255),
-    correct_points INT NOT NULL DEFAULT 0,  
+    --correct_points INT NOT NULL DEFAULT 0,  
     deleted_at TIMESTAMP WITH TIME ZONE,
 
     CONSTRAINT fk_themes_users FOREIGN KEY (created_by_id) REFERENCES users(id) ON DELETE RESTRICT

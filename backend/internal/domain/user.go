@@ -25,6 +25,11 @@ type User struct {
 	DeletedAt    *time.Time
 }
 
+type UserShort struct {
+	ID uuid.UUID
+	Name string
+}
+
 type UserWithDetail struct {
 	User
 	Department *DepartmentDetail

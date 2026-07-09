@@ -53,6 +53,7 @@ func main() {
 	departmentRepo := repository.NewDepartmentRepository(dbPostgres)
 	roleRepo := repository.NewRoleRepository(dbPostgres)
 	userRepo := repository.NewUserRepository(dbPostgres)
+	themeRepo := repository.NewThemeRepository(dbPostgres)
 
 	// Сервисы
 	jwtCfg := jwt.Config{
@@ -69,6 +70,7 @@ func main() {
 	roleService := service.NewRoleService(roleRepo, permissionService)
 	userService := service.NewUserService(userRepo, permissionService, dbPostgres)
 	defer userService.Shutdown() // остановка кэша пользователей
+	themeService := service.NewThemeService(themeRepo, permissionService)
 
 	// Создание / проверка администратора
 	if err := userService.CheckOrCreateAdmin(context.Background(), cfg.Admin); err != nil {
@@ -100,6 +102,7 @@ func main() {
 	handler.NewRoleHandler(r, authMiddleware, roleService)
 	handler.NewUserHandler(r, authMiddleware, userService)
 	handler.NewPermissionHandler(r, authMiddleware, permissionService)
+	handler.NewThemeHandlers(r, authMiddleware, themeService)
 
 	// HTTP-сервер
 	srv := &http.Server{
