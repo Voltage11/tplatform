@@ -64,3 +64,5 @@ backend/.env.local
 # Разрешаем коммитить только шаблоны настроек
 !*.env.example
  
+
+ backend/uploads/

@@ -29,6 +29,12 @@ const router = createRouter({
       component: () => import('@/pages/UserListPage.vue'),
       meta: { requiresAuth: true, title: 'Пользователи' },
     },
+    { 
+      path: '/themes', 
+      name: 'themes', 
+      component: () => import('@/pages/ThemeListPage.vue'), 
+      meta: { requiresAuth: true, title: 'Темы' },
+    },
     {
       path: '/login',
       name: 'login',

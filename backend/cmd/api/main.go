@@ -78,7 +78,7 @@ func main() {
 	}
 
 	// Роутер
-	r := chi.NewRouter()
+	r := chi.NewRouter()	
 
 	// Middleware
 	r.Use(cors.Handler(cors.Options{
@@ -103,6 +103,9 @@ func main() {
 	handler.NewUserHandler(r, authMiddleware, userService)
 	handler.NewPermissionHandler(r, authMiddleware, permissionService)
 	handler.NewThemeHandlers(r, authMiddleware, themeService)
+	handler.NewUploadHandler(r, authMiddleware, cfg.Upload, appLogger)
+
+	r.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
 
 	// HTTP-сервер
 	srv := &http.Server{

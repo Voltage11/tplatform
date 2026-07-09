@@ -15,6 +15,12 @@ type Config struct {
 	Logger   LoggerConfig
 	JWT      JWTConfig
 	Admin    AdminConfig
+	Upload UploadConfig
+}
+
+type UploadConfig struct {
+    Dir       string `env:"UPLOAD_DIR" env-default:"./uploads"`
+    MaxSizeMB int64  `env:"UPLOAD_MAX_SIZE_MB" env-default:"5"`
 }
 
 type AdminConfig struct {

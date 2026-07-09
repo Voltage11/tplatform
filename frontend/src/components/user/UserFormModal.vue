@@ -34,7 +34,7 @@ const isSubmitting = ref(false);
 const { fieldErrors, generalError, setServerError, clearErrors } = useFieldErrors();
 
 // Заполнение формы при открытии
-watch(() => props.visible, (newVal) => {
+watch(() => props.visible, async (newVal) => {
   if (newVal) {
     if (props.editingUser) {
       const u = props.editingUser;
@@ -44,9 +44,49 @@ watch(() => props.visible, (newVal) => {
       email.value = u.email;
       isActive.value = u.is_active;
       isAdmin.value = u.is_admin;
-      departmentId.value = u.department?.id || null;
-      roleId.value = u.role?.id || null;
+
+      // Загружаем начальные опции, если их ещё нет
+      if (initialDepartments.value.length === 0) {
+        try {
+          const deptRes = await departmentApi.fetchDepartments(1, 5);
+          initialDepartments.value = deptRes.data.map(d => ({ id: d.id, name: d.name }));
+        } catch (e) { /* ignore */ }
+      }
+      if (initialRoles.value.length === 0) {
+        try {
+          const roleRes = await roleApi.fetchRoles(1, 5);
+          initialRoles.value = roleRes.data.map(r => ({ id: r.id, name: r.name }));
+        } catch (e) { /* ignore */ }
+      }
+
+      // Гарантируем, что выбранные отдел и роль есть в списках
+      if (u.department) {
+        const exists = initialDepartments.value.some(d => d.id === u.department!.id)
+        if (!exists) {
+          initialDepartments.value = [
+            ...initialDepartments.value,
+            { id: u.department.id, name: u.department.name },
+          ]
+        }
+        departmentId.value = u.department.id
+      } else {
+        departmentId.value = null
+      }
+
+      if (u.role) {
+        const exists = initialRoles.value.some(r => r.id === u.role!.id)
+        if (!exists) {
+          initialRoles.value = [
+            ...initialRoles.value,
+            { id: u.role.id, name: u.role.name },
+          ]
+        }
+        roleId.value = u.role.id
+      } else {
+        roleId.value = null
+      }
     } else {
+      // создание нового пользователя – сбрасываем поля
       firstName.value = '';
       secondName.value = '';
       lastName.value = '';
@@ -56,6 +96,20 @@ watch(() => props.visible, (newVal) => {
       isAdmin.value = false;
       departmentId.value = null;
       roleId.value = null;
+
+      // загружаем начальные опции, если их ещё нет
+      if (initialDepartments.value.length === 0) {
+        try {
+          const deptRes = await departmentApi.fetchDepartments(1, 5);
+          initialDepartments.value = deptRes.data.map(d => ({ id: d.id, name: d.name }));
+        } catch (e) { /* ignore */ }
+      }
+      if (initialRoles.value.length === 0) {
+        try {
+          const roleRes = await roleApi.fetchRoles(1, 5);
+          initialRoles.value = roleRes.data.map(r => ({ id: r.id, name: r.name }));
+        } catch (e) { /* ignore */ }
+      }
     }
     clearErrors();
   }

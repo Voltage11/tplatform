@@ -21,6 +21,7 @@ async function handleLogout() {
         <router-link to="/users" class="nav-link">Пользователи</router-link>
         <router-link to="/departments" class="nav-link">Отделы</router-link>
         <router-link to="/roles" class="nav-link">Роли</router-link>
+        <router-link to="/themes" class="nav-link">Темы</router-link>
       </nav>
     </div>
 
