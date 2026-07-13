@@ -54,6 +54,7 @@ func main() {
 	roleRepo := repository.NewRoleRepository(dbPostgres)
 	userRepo := repository.NewUserRepository(dbPostgres)
 	themeRepo := repository.NewThemeRepository(dbPostgres)
+	questionRepo := repository.NewQuestionRepository(dbPostgres)
 
 	// Сервисы
 	jwtCfg := jwt.Config{
@@ -71,6 +72,7 @@ func main() {
 	userService := service.NewUserService(userRepo, permissionService, dbPostgres)
 	defer userService.Shutdown() // остановка кэша пользователей
 	themeService := service.NewThemeService(themeRepo, permissionService)
+	questionService := service.NewQuestionService(questionRepo, permissionService, dbPostgres)
 
 	// Создание / проверка администратора
 	if err := userService.CheckOrCreateAdmin(context.Background(), cfg.Admin); err != nil {
@@ -102,7 +104,7 @@ func main() {
 	handler.NewRoleHandler(r, authMiddleware, roleService)
 	handler.NewUserHandler(r, authMiddleware, userService)
 	handler.NewPermissionHandler(r, authMiddleware, permissionService)
-	handler.NewThemeHandlers(r, authMiddleware, themeService)
+	handler.NewThemeHandlers(r, authMiddleware, themeService, questionService)
 	handler.NewUploadHandler(r, authMiddleware, cfg.Upload, appLogger)
 
 	r.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
