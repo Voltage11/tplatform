@@ -1,0 +1,6020 @@
+=== FILE: ./internal/cache/user.go ===
+package cache
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/google/uuid"
+)
+
+type UserCache interface {
+	GetByID(id uuid.UUID) *domain.User
+	GetByEmail(email string) *domain.User
+	Set(user *domain.User)
+	Delete(id uuid.UUID)
+	ClearExpired()
+	Stop()
+}
+
+type userItem struct {
+	*domain.User
+	expiredAt time.Time
+}
+
+type userCache struct {
+	mu         sync.RWMutex
+	ttl        time.Duration
+	users      map[uuid.UUID]*userItem
+	usersEmail map[string]*userItem
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func NewUserCache(ttl time.Duration) UserCache {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c := &userCache{
+		ttl:        ttl,
+		users:      make(map[uuid.UUID]*userItem),
+		usersEmail: make(map[string]*userItem),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	// Запускаем горутину очистки
+	go c.cleanupLoop()
+
+	return c
+}
+
+func (c *userCache) cleanupLoop() {
+	ticker := time.NewTicker(c.ttl)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.ClearExpired()
+		}
+	}
+}
+
+func (c *userCache) GetByID(id uuid.UUID) *domain.User {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	item, ok := c.users[id]
+	if !ok {
+		return nil
+	}
+
+	if time.Now().UTC().Before(item.expiredAt) {
+		return item.User
+	}
+
+	// Истекший кэш удаляем при следующем вызове ClearExpired
+	return nil
+}
+
+func (c *userCache) GetByEmail(email string) *domain.User {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	item, ok := c.usersEmail[email]
+	if !ok {
+		return nil
+	}
+
+	if time.Now().UTC().Before(item.expiredAt) {
+		return item.User
+	}
+
+	return nil
+}
+
+func (c *userCache) Set(user *domain.User) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Если пользователь уже есть с другим email, удаляем старую запись в usersEmail
+	if oldItem, ok := c.users[user.ID]; ok && oldItem.Email != user.Email {
+		delete(c.usersEmail, oldItem.Email)
+	}
+
+	item := &userItem{
+		User:      user,
+		expiredAt: time.Now().UTC().Add(c.ttl),
+	}
+
+	c.users[user.ID] = item
+	c.usersEmail[user.Email] = item
+}
+
+func (c *userCache) Delete(id uuid.UUID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if item, ok := c.users[id]; ok {
+		delete(c.users, id)
+		delete(c.usersEmail, item.Email)
+	}
+}
+
+func (c *userCache) ClearExpired() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now().UTC()
+	for id, item := range c.users {
+		if now.After(item.expiredAt) {
+			delete(c.users, id)
+			delete(c.usersEmail, item.Email)
+		}
+	}
+}
+
+func (c *userCache) Stop() {
+	c.cancel()
+}
+-e 
+
+=== FILE: ./internal/service/permission.go ===
+package service
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/appcontext"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/google/uuid"
+)
+
+type permissionService struct {
+	repo     domain.PermissionsRepository
+	cache    map[uuid.UUID][]domain.RolePermission
+	cacheMu  sync.RWMutex
+	cacheTTL time.Duration
+	cachedAt map[uuid.UUID]time.Time
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+func NewPermissionService(repo domain.PermissionsRepository) domain.PermissionService {
+	s := &permissionService{
+		repo:     repo,
+		cache:    make(map[uuid.UUID][]domain.RolePermission),
+		cacheTTL: 5 * time.Minute,
+		cachedAt: make(map[uuid.UUID]time.Time),
+		stopCh:   make(chan struct{}),
+	}
+	go s.startCleaner()
+	return s
+}
+
+// --- основные методы ---
+
+func (s *permissionService) SetAction(ctx context.Context, roleID uuid.UUID, entity domain.PermissionEntity, actionName string) error {
+	if err := s.repo.SetAction(ctx, roleID, entity.Name, actionName); err != nil {
+		return err
+	}
+	s.invalidate(roleID)
+	return nil
+}
+
+func (s *permissionService) RemoveAction(ctx context.Context, roleID uuid.UUID, entity domain.PermissionEntity, actionName string) error {
+	if err := s.repo.RemoveAction(ctx, roleID, entity.Name, actionName); err != nil {
+		return err
+	}
+	s.invalidate(roleID)
+	return nil
+}
+
+func (s *permissionService) GetForRole(ctx context.Context, roleID uuid.UUID) ([]domain.PermissionEntityWithActions, error) {
+	perms, err := s.getCached(roleID, func() ([]domain.RolePermission, error) {
+		return s.repo.GetRolePermissions(ctx, roleID)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	active := make(map[string]bool, len(perms))
+	for _, p := range perms {
+		active[p.EntityName+":"+p.ActionName] = true
+	}
+
+	base := domain.GetPermissionsEntitiesWithActions()
+	result := make([]domain.PermissionEntityWithActions, len(base))
+	for i, entity := range base {
+		result[i].Entity = entity.Entity
+		result[i].Actions = make([]domain.PermissionAction, len(entity.Actions))
+		for j, action := range entity.Actions {
+			result[i].Actions[j] = action.WithActive(active[entity.Entity.Name+":"+action.Name])
+		}
+	}
+	return result, nil
+}
+
+func (s *permissionService) Can(ctx context.Context, user *domain.User, entityName, actionName string) bool {
+	if user == nil {
+		return false
+	}
+	if user.IsAdmin {
+		return true
+	}
+	if user.RoleID == nil {
+		return false
+	}
+
+	perms, err := s.getCached(*user.RoleID, func() ([]domain.RolePermission, error) {
+		return s.repo.GetRolePermissions(ctx, *user.RoleID)
+	})
+	if err != nil {
+		return false
+	}
+
+	for _, p := range perms {
+		if p.EntityName == entityName && p.ActionName == actionName {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *permissionService) CanFromCtx(ctx context.Context, entityName, actionName string) bool {
+	user := appcontext.GetUserFromContext(ctx)
+	return s.Can(ctx, user, entityName, actionName)
+}
+
+func (s *permissionService) ReplacePermissions(ctx context.Context, roleID uuid.UUID, targets []domain.PermissionTarget) error {
+	// очищаем текущие права
+	if err := s.repo.ClearRolePermissions(ctx, roleID); err != nil {
+		return err
+	}
+	// добавляем новые
+	for _, t := range targets {
+		if err := s.repo.SetAction(ctx, roleID, t.EntityName, t.ActionName); err != nil {
+			return err
+		}
+	}
+	s.invalidate(roleID)
+	return nil
+}
+
+// --- кэш ---
+
+func (s *permissionService) getCached(roleID uuid.UUID, loader func() ([]domain.RolePermission, error)) ([]domain.RolePermission, error) {
+	s.cacheMu.RLock()
+	if cachedAt, ok := s.cachedAt[roleID]; ok && time.Since(cachedAt) < s.cacheTTL {
+		val := s.cache[roleID]
+		s.cacheMu.RUnlock()
+		return val, nil
+	}
+	s.cacheMu.RUnlock()
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	if cachedAt, ok := s.cachedAt[roleID]; ok && time.Since(cachedAt) < s.cacheTTL {
+		return s.cache[roleID], nil
+	}
+
+	perms, err := loader()
+	if err != nil {
+		return nil, err
+	}
+
+	s.cache[roleID] = perms
+	s.cachedAt[roleID] = time.Now()
+	return perms, nil
+}
+
+func (s *permissionService) invalidate(roleID uuid.UUID) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	delete(s.cache, roleID)
+	delete(s.cachedAt, roleID)
+}
+
+func (s *permissionService) startCleaner() {
+	ticker := time.NewTicker(s.cacheTTL)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.clearExpired()
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+func (s *permissionService) clearExpired() {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	now := time.Now()
+	for id, at := range s.cachedAt {
+		if now.Sub(at) >= s.cacheTTL {
+			delete(s.cache, id)
+			delete(s.cachedAt, id)
+		}
+	}
+}
+
+func (s *permissionService) Shutdown() {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+}-e 
+
+=== FILE: ./internal/service/department.go ===
+package service
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+)
+
+type departmentService struct {
+	repo              domain.DepartmentRepository
+	permissionService domain.PermissionService
+}
+
+func NewDepartmentService(repo domain.DepartmentRepository, permissionService domain.PermissionService) domain.DepartmentService {
+	return &departmentService{
+		repo:              repo,
+		permissionService: permissionService,
+	}
+}
+
+func (d *departmentService) Create(ctx context.Context, department *domain.Department) error {
+	if !d.permissionService.CanFromCtx(ctx, domain.EntityDepartments.Name, domain.ActionCreate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return d.repo.Create(ctx, department)
+}
+
+func (d *departmentService) Update(ctx context.Context, department *domain.Department) error {
+	if !d.permissionService.CanFromCtx(ctx, domain.EntityDepartments.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return d.repo.Update(ctx, department)
+}
+
+func (d *departmentService) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	if !d.permissionService.CanFromCtx(ctx, domain.EntityDepartments.Name, domain.ActionSoftDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return d.repo.SoftDelete(ctx, id)
+}
+
+func (d *departmentService) HardDelete(ctx context.Context, id uuid.UUID) error {
+	if !d.permissionService.CanFromCtx(ctx, domain.EntityDepartments.Name, domain.ActionHardDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return d.repo.HardDelete(ctx, id)
+}
+
+func (d *departmentService) GetByID(ctx context.Context, id uuid.UUID) (*domain.Department, error) {
+	if !d.permissionService.CanFromCtx(ctx, domain.EntityDepartments.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	return d.repo.GetByID(ctx, id)
+}
+
+func (d *departmentService) GetList(ctx context.Context, filter domain.DepartmentFilter) (*domain.PagedResult[*domain.Department], error) {
+	if !d.permissionService.CanFromCtx(ctx, domain.EntityDepartments.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	departments, total, err := d.repo.GetList(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	pagination := domain.NewPaginationResponse(filter.Pagination, total)
+
+	return &domain.PagedResult[*domain.Department]{
+		Data:       departments,
+		Pagination: pagination,
+	}, nil
+}
+-e 
+
+=== FILE: ./internal/service/auth.go ===
+package service
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/Voltage11/tplatform/pkg/hash"
+	"github.com/Voltage11/tplatform/pkg/password"
+	jwtpkg "github.com/Voltage11/tplatform/pkg/jwt"
+)
+
+// AuthService - экспортируемая структура (с большой буквы)
+type AuthService struct {
+	userRepo    domain.UserRepository
+	sessionRepo domain.SessionRepository
+	jwt         *jwtpkg.JWTService
+}
+
+type TokenPair struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+}
+
+// NewAuthService - экспортируемый конструктор (с большой буквы)
+func NewAuthService(
+	userRepo domain.UserRepository,
+	sessionRepo domain.SessionRepository,
+	jwtCfg jwtpkg.Config,
+) *AuthService {
+	return &AuthService{
+		userRepo:    userRepo,
+		sessionRepo: sessionRepo,
+		jwt:         jwtpkg.NewJWTService(jwtCfg),
+	}
+}
+
+// Login проверяет email/пароль, создаёт сессию и возвращает токены
+func (a *AuthService) Login(ctx context.Context, email, pass, userAgent, clientIP string) (*TokenPair, error) {
+	// 1. Найти пользователя по email
+	user, err := a.userRepo.GetByEmail(ctx, email)
+	if err != nil {
+		return nil, apperror.NewUnauthorized("неверный email или пароль", nil)
+	}
+	// 2. Проверить пароль
+	if !password.Verify(user.PasswordHash, pass) {
+		return nil, apperror.NewUnauthorized("неверный email или пароль", nil)
+	}
+	// 3. Проверить активен ли пользователь
+	if !user.IsActive {
+		return nil, apperror.NewForbidden("учётная запись деактивирована", nil)
+	}
+
+	// 4. Сгенерировать токены
+	accessToken, err := a.jwt.GenerateAccessToken(user.ID)
+	if err != nil {
+		return nil, apperror.NewInternal("ошибка генерации токена", err)
+	}
+	refreshToken, err := a.jwt.GenerateRefreshToken()
+	if err != nil {
+		return nil, apperror.NewInternal("ошибка генерации refresh токена", err)
+	}
+
+	// 5. Сохранить сессию
+	refreshHash := hash.ToHash(refreshToken)
+	session := &domain.Session{
+		ID:               uuid.New(),
+		UserID:           user.ID,
+		RefreshTokenHash: refreshHash,
+		ExpiresAt:        time.Now().UTC().Add(a.jwt.GetRefreshTTL()),
+		CreatedAt:        time.Now().UTC(),
+		UserAgent:        userAgent,
+		ClientIP:         clientIP,
+	}
+	if err := a.sessionRepo.Create(ctx, session); err != nil {
+		return nil, err
+	}
+
+	return &TokenPair{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresIn:    int64(a.jwt.GetAccessTTL().Seconds()),
+	}, nil
+}
+
+// Logout отзывает сессию по refresh токену
+func (a *AuthService) Logout(ctx context.Context, refreshToken string) error {
+	hashToken := hash.ToHash(refreshToken)
+	session, err := a.sessionRepo.GetByRefreshTokenHash(ctx, hashToken)
+	if err != nil {
+		return apperror.NewNotFound("сессия не найдена", nil)
+	}
+	return a.sessionRepo.Revoke(ctx, session.ID)
+}
+
+// Refresh выдаёт новую пару токенов по refresh токену
+func (a *AuthService) Refresh(ctx context.Context, refreshToken string) (*TokenPair, error) {
+	hashToken := hash.ToHash(refreshToken)
+	session, err := a.sessionRepo.GetByRefreshTokenHash(ctx, hashToken)
+	if err != nil {
+		return nil, apperror.NewUnauthorized("недействительный refresh токен", nil)
+	}
+	if session.RevokedAt != nil {
+		return nil, apperror.NewUnauthorized("сессия отозвана", nil)
+	}
+	if time.Now().UTC().After(session.ExpiresAt) {
+		return nil, apperror.NewUnauthorized("refresh токен истёк", nil)		
+	}
+
+	user, err := a.userRepo.GetByID(ctx, session.UserID)
+    if err != nil {
+        return nil, apperror.NewUnauthorized("пользователь не найден", err)
+    }
+    if !user.IsActive {
+        return nil, apperror.NewForbidden("учётная запись деактивирована", nil)
+    }
+
+	// Генерируем новый refresh
+	newRefreshToken, err := a.jwt.GenerateRefreshToken()
+	if err != nil {
+		return nil, apperror.NewInternal("ошибка генерации refresh токена", err)
+	}
+	newRefreshHash := hash.ToHash(newRefreshToken)
+
+	newSession := &domain.Session{
+		ID:               uuid.New(),
+		UserID:           session.UserID,
+		RefreshTokenHash: newRefreshHash,
+		ExpiresAt:        time.Now().UTC().Add(a.jwt.GetRefreshTTL()),
+		CreatedAt:        time.Now().UTC(),
+		UserAgent:        session.UserAgent,
+		ClientIP:         session.ClientIP,
+	}
+	if err := a.sessionRepo.Create(ctx, newSession); err != nil {
+		return nil, err
+	}
+
+	// Отзываем старую сессию
+	_ = a.sessionRepo.Revoke(ctx, session.ID)
+
+	// Новый access
+	accessToken, err := a.jwt.GenerateAccessToken(session.UserID)
+	if err != nil {
+		return nil, apperror.NewInternal("ошибка генерации токена", err)
+	}
+
+	return &TokenPair{
+		AccessToken:  accessToken,
+		RefreshToken: newRefreshToken,
+		ExpiresIn:    int64(a.jwt.GetAccessTTL().Seconds()),
+	}, nil
+}
+
+// ValidateAccessToken валидирует access токен и возвращает userID как строку (для middleware)
+func (a *AuthService) ValidateAccessToken(tokenString string) (uuid.UUID, error) {
+	return a.jwt.ValidateAccessToken(tokenString)
+}
+-e 
+
+=== FILE: ./internal/service/role.go ===
+package service
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+)
+
+type roleService struct {
+	repo              domain.RoleRepository
+	permissionService domain.PermissionService
+}
+
+func NewRoleService(repo domain.RoleRepository, permissionService domain.PermissionService) domain.RoleService {
+	return &roleService{
+		repo:              repo,
+		permissionService: permissionService,
+	}
+}
+
+func (s *roleService) Create(ctx context.Context, role *domain.Role) error {
+	if !s.permissionService.CanFromCtx(ctx, domain.EntityRoles.Name, domain.ActionCreate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return s.repo.Create(ctx, role)
+}
+
+func (s *roleService) Update(ctx context.Context, role *domain.Role) error {
+	if !s.permissionService.CanFromCtx(ctx, domain.EntityRoles.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return s.repo.Update(ctx, role)
+}
+
+func (s *roleService) GetByID(ctx context.Context, id uuid.UUID) (*domain.Role, error) {
+	if !s.permissionService.CanFromCtx(ctx, domain.EntityRoles.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	return s.repo.GetByID(ctx, id)
+}
+
+func (s *roleService) GetList(ctx context.Context, filter domain.RoleFilter) (*domain.PagedResult[*domain.Role], error) {
+	if !s.permissionService.CanFromCtx(ctx, domain.EntityRoles.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	departments, total, err := s.repo.GetList(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	pagination := domain.NewPaginationResponse(filter.Pagination, total)
+
+	return &domain.PagedResult[*domain.Role]{
+		Data:       departments,
+		Pagination: pagination,
+	}, nil
+}
+
+func (s *roleService) Delete(ctx context.Context, id uuid.UUID) error {
+	if !s.permissionService.CanFromCtx(ctx, domain.EntityRoles.Name, domain.ActionHardDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return s.repo.Delete(ctx, id)
+}
+-e 
+
+=== FILE: ./internal/service/user.go ===
+package service
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/appcontext"
+	"github.com/Voltage11/tplatform/internal/cache"
+	"github.com/Voltage11/tplatform/internal/config"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/Voltage11/tplatform/pkg/password"
+	"github.com/google/uuid"
+)
+
+const (
+	userCacheDuration = 5 * time.Minute
+)
+
+type userService struct {
+	repo             domain.UserRepository
+	cache            cache.UserCache
+	permisionServise domain.PermissionService
+	txManager        domain.Transactor
+}
+
+func NewUserService(repo domain.UserRepository, permisionServise domain.PermissionService, txManager domain.Transactor) domain.UserService {
+	return &userService{
+		repo:             repo,
+		cache:            cache.NewUserCache(userCacheDuration),
+		permisionServise: permisionServise,
+		txManager:        txManager,
+	}
+}
+
+func (u *userService) Create(ctx context.Context, user *domain.User) error {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionCreate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	hashed, err := password.Hash(user.PasswordHash)
+	if err != nil {
+		return fmt.Errorf("ошибка хеширования пароля: %w", err)
+	}
+	user.PasswordHash = hashed
+
+	if err := u.repo.Create(ctx, user); err != nil {
+		return err
+	}
+
+	u.cache.Set(user)
+	return nil
+}
+
+func (u *userService) Update(ctx context.Context, user *domain.User) error {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	if err := u.repo.Update(ctx, user); err != nil {
+		return err
+	}
+
+	u.cache.Set(user)
+	return nil
+}
+
+func (u *userService) SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	if err := u.repo.SetIsActive(ctx, id, isActive); err != nil {
+		return err
+	}
+
+	u.cache.Delete(id)
+	return nil
+}
+
+func (u *userService) HardDelete(ctx context.Context, id uuid.UUID) error {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionHardDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	if err := u.repo.HardDelete(ctx, id); err != nil {
+		return err
+	}
+
+	u.cache.Delete(id)
+	return nil
+}
+
+func (u *userService) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionSoftDelete.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	if err := u.repo.SoftDelete(ctx, id); err != nil {
+		return err
+	}
+
+	u.cache.Delete(id)
+	return nil
+}
+
+func (u *userService) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
+	// if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+	// 	return nil, apperror.NewForbiddenWithoutErr()
+	// }
+
+	// Проверяем кэш
+	if user := u.cache.GetByID(id); user != nil {
+		return user, nil
+	}
+
+	user, err := u.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	u.cache.Set(user)
+	return user, nil
+}
+
+func (u *userService) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.UserWithDetail, error) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	return u.repo.GetByIDWithDetail(ctx, id)
+}
+
+func (u *userService) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	// Проверяем кэш
+	if user := u.cache.GetByEmail(email); user != nil {
+		return user, nil
+	}
+
+	user, err := u.repo.GetByEmail(ctx, email)
+	if err != nil {
+		return nil, err
+	}
+
+	u.cache.Set(user)
+	return user, nil
+}
+
+func (u *userService) GetByEmailWithDetail(ctx context.Context, email string) (*domain.UserWithDetail, error) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	return u.repo.GetByEmailWithDetail(ctx, email)
+}
+
+func (u *userService) GetList(ctx context.Context, filter domain.UserFilter) (*domain.PagedResult[*domain.UserWithDetail], error) {
+	if !u.permisionServise.CanFromCtx(ctx, domain.EntityUsers.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	users, total, err := u.repo.GetList(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	pagination := domain.NewPaginationResponse(filter.Pagination, total)
+
+	return &domain.PagedResult[*domain.UserWithDetail]{
+		Data:       users,
+		Pagination: pagination,
+	}, nil
+}
+
+func (u *userService) CheckOrCreateAdmin(ctx context.Context, adminCfg config.AdminConfig) error {
+
+	userToCtx := domain.User{IsAdmin: true}
+	ctx = appcontext.SetUserToContext(ctx, &userToCtx)
+
+	// Оборачиваем всю операцию проверки и создания/обновления в транзакцию
+	return u.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
+		// 1. Ищем админа внутри транзакции
+		user, err := u.repo.GetByEmail(txCtx, adminCfg.Email)
+		if err != nil {
+			if apperror.GetType(err) != apperror.ErrNotFound {
+				return fmt.Errorf("ошибка при поиске администратора: %w", err)
+			}
+			user = nil
+		}
+
+		// 2. Если админ найден, при необходимости обновляем его статус
+		if user != nil {
+			if user.IsActive && user.IsAdmin {
+				return nil
+			}
+
+			user.IsActive = true
+			user.IsAdmin = true
+			// Вызываем метод репозитория напрямую с txCtx
+			if err := u.repo.Update(txCtx, user); err != nil {
+				return fmt.Errorf("не удалось обновить администратора: %w", err)
+			}
+			// Кэш обновляем внутри замыкания, он применится только если Commit пройдет успешно
+			u.cache.Set(user)
+			return nil
+		}
+
+		// 3. Если админа нет — создаём нового
+		createdUser := &domain.User{
+			ID:           uuid.New(),
+			FirstName:    "Админ",
+			LastName:     "Администратор",
+			Email:        adminCfg.Email,
+			PasswordHash: adminCfg.Password,
+			IsActive:     true,
+			IsAdmin:      true,
+		}
+
+		hashed, err := password.Hash(createdUser.PasswordHash)
+		if err != nil {
+			return fmt.Errorf("ошибка хеширования пароля админа: %w", err)
+		}
+		createdUser.PasswordHash = hashed
+
+		// Записываем в БД внутри транзакции
+		if err := u.repo.Create(txCtx, createdUser); err != nil {
+			return fmt.Errorf("не удалось создать администратора: %w", err)
+		}
+
+		u.cache.Set(createdUser)
+		return nil
+	})
+}
+
+func (u *userService) Shutdown() {
+	u.cache.Stop()
+}
+-e 
+
+=== FILE: ./internal/service/theme.go ===
+package service
+
+import (
+    "context"
+
+    "github.com/Voltage11/tplatform/internal/appcontext"
+    "github.com/Voltage11/tplatform/internal/domain"
+    "github.com/Voltage11/tplatform/internal/types/apperror"
+    "github.com/google/uuid"
+)
+
+type themeService struct {
+    themeRepo   domain.ThemeRepository
+    permissions domain.PermissionService
+}
+
+func NewThemeService(themeRepo domain.ThemeRepository, permissions domain.PermissionService) domain.ThemeService {
+    return &themeService{
+        themeRepo:   themeRepo,
+        permissions: permissions,
+    }
+}
+
+func (t *themeService) GetByID(ctx context.Context, id uuid.UUID) (*domain.Theme, error) {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionView.Name) {
+        return nil, apperror.NewForbiddenWithoutErr()
+    }
+    return t.themeRepo.GetByID(ctx, id)
+}
+
+func (t *themeService) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.ThemeWithDetail, error) {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionView.Name) {
+        return nil, apperror.NewForbiddenWithoutErr()
+    }
+    return t.themeRepo.GetByIDWithDetail(ctx, id)
+}
+
+func (t *themeService) Create(ctx context.Context, theme *domain.Theme) error {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionCreate.Name) {
+        return apperror.NewForbiddenWithoutErr()
+    }
+
+    user := appcontext.GetUserFromContext(ctx)
+    if user == nil {
+        return apperror.NewUnauthorized("пользователь не аутентифицирован", nil)
+    }
+    theme.CreatedByID = user.ID
+    return t.themeRepo.Create(ctx, theme)
+}
+
+func (t *themeService) Update(ctx context.Context, theme *domain.Theme) error {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionUpdate.Name) {
+        return apperror.NewForbiddenWithoutErr()
+    }
+    return t.themeRepo.Update(ctx, theme)
+}
+
+func (t *themeService) Delete(ctx context.Context, id uuid.UUID) error {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionSoftDelete.Name) {
+        return apperror.NewForbiddenWithoutErr()
+    }
+    return t.themeRepo.Delete(ctx, id)
+}
+
+func (t *themeService) SetActive(ctx context.Context, id uuid.UUID, isActive bool) error {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionUpdate.Name) {
+        return apperror.NewForbiddenWithoutErr()
+    }
+    return t.themeRepo.SetActive(ctx, id, isActive)
+}
+
+func (t *themeService) GetList(ctx context.Context, filter domain.ThemeFilter) (*domain.PagedResult[*domain.ThemeWithDetail], error) {
+    if !t.permissions.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionView.Name) {
+        return nil, apperror.NewForbiddenWithoutErr()
+    }
+
+    themes, total, err := t.themeRepo.GetList(ctx, filter)
+    if err != nil {
+        return nil, err
+    }
+
+    pagination := domain.NewPaginationResponse(filter.Pagination, total)
+    return &domain.PagedResult[*domain.ThemeWithDetail]{
+        Data:       themes,
+        Pagination: pagination,
+    }, nil
+}-e 
+
+=== FILE: ./internal/service/question.go ===
+package service
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+)
+
+type questionService struct {
+	questionRepository domain.QuestionRepository
+	permissionService  domain.PermissionService
+	txManager          domain.Transactor
+}
+
+func NewQuestionService(questionRepository domain.QuestionRepository, permissionService domain.PermissionService, txManager domain.Transactor) domain.QuestionService {
+	return &questionService{
+		questionRepository: questionRepository,
+		permissionService:  permissionService,
+		txManager:          txManager,
+	}
+}
+
+func (q *questionService) GetByID(ctx context.Context, id uuid.UUID) (*domain.Question, error) {
+	if !q.permissionService.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	return q.questionRepository.GetByID(ctx, id)
+}
+
+func (q *questionService) Create(ctx context.Context, question *domain.Question) error {
+	if !q.permissionService.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionCreate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+	// В транзакции найдем кол. вопросов для сортировочного номера и далее вставим вопрос
+	return q.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
+		// Кол. вопросов в теме TODO: хз пока не знаю, может не кол. вопросов, а макс. значение искать, после фронта проверим
+		cnt, err := q.questionRepository.GetLastPositionInTheme(txCtx, question.ThemeID)
+		if err != nil {
+			return err
+		}
+		// Увеличим сортировочний индекс на единицу, пока так, дале проверим на макс значение, еще проверим смену сортировки
+		question.SortOrder = cnt + 1
+
+		return q.questionRepository.Create(txCtx, question)
+	})
+}
+
+func (q *questionService) Update(ctx context.Context, question *domain.Question) error {
+	if !q.permissionService.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionUpdate.Name) {
+		return apperror.NewForbiddenWithoutErr()
+	}
+
+	return q.questionRepository.Update(ctx, question)
+}
+
+func (s *questionService) Delete(ctx context.Context, id uuid.UUID) error {
+    if !s.permissionService.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionHardDelete.Name) {
+        return apperror.NewForbiddenWithoutErr()
+    }
+
+    return s.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
+        // Находим вопрос, чтобы узнать theme_id
+        question, err := s.questionRepository.GetByID(txCtx, id)
+        if err != nil {
+            return err
+        }
+
+        // Удаляем вопрос
+        if err := s.questionRepository.Delete(txCtx, id); err != nil {
+            return err
+        }
+
+        // Получаем оставшиеся вопросы темы (отсортированные)
+        remaining, err := s.questionRepository.GetList(txCtx, question.ThemeID)
+        if err != nil {
+            return err
+        }
+
+        // Перенумеровываем
+        for i, q := range remaining {
+            if err := s.questionRepository.SetSortOrder(txCtx, q.ID, i+1); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+
+func (q *questionService) GetList(ctx context.Context, themeID uuid.UUID) ([]*domain.Question, error) {
+	if !q.permissionService.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionView.Name) {
+		return nil, apperror.NewForbiddenWithoutErr()
+	}
+
+	return q.questionRepository.GetList(ctx, themeID)
+}
+
+func (s *questionService) SetSortOrder(ctx context.Context, id uuid.UUID, newPosition int) error {
+    if !s.permissionService.CanFromCtx(ctx, domain.EntityThemes.Name, domain.ActionUpdate.Name) {
+        return apperror.NewForbiddenWithoutErr()
+    }
+
+    return s.txManager.WithinTransaction(ctx, func(txCtx context.Context) error {
+        // Получаем перемещаемый вопрос
+        question, err := s.questionRepository.GetByID(txCtx, id)
+        if err != nil {
+            return err
+        }
+        if newPosition < 1 {
+            return apperror.NewBadRequest("позиция должна быть >= 1", nil)
+        }
+
+        // Получаем все вопросы темы, уже отсортированные по sort_order
+        allQuestions, err := s.questionRepository.GetList(txCtx, question.ThemeID)
+        if err != nil {
+            return err
+        }
+
+        // Строим новый список
+        var newList []*domain.Question
+        inserted := false
+        for _, item := range allQuestions {
+            // Пропускаем перемещаемый вопрос (он будет вставлен позже)
+            if item.ID == id {
+                continue
+            }
+            // Если мы ещё не вставили вопрос и достигли нужной позиции (позиция = индекс+1)
+            if !inserted && len(newList)+1 == newPosition {
+                newList = append(newList, question)
+                inserted = true
+            }
+            newList = append(newList, item)
+        }
+        // Если позиция больше количества вопросов, вставляем в конец
+        if !inserted {
+            newList = append(newList, question)
+        }
+
+        // Перенумеровываем и сохраняем
+        for i, q := range newList {
+            if err := s.questionRepository.SetSortOrder(txCtx, q.ID, i+1); err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+-e 
+
+=== FILE: ./internal/types/apperror/http.go ===
+package apperror
+
+import "net/http"
+
+// HTTPStatusFromError возвращает HTTP статус код по ошибке
+func HTTPStatusFromError(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	switch GetType(err) {
+	case ErrNotFound:
+		return http.StatusNotFound
+	case ErrBadRequest:
+		return http.StatusBadRequest
+	case ErrAlreadyExists:
+		return http.StatusConflict
+	case ErrUnauthorized:
+		return http.StatusUnauthorized
+	case ErrForbidden:
+		return http.StatusForbidden
+	}
+	return http.StatusInternalServerError
+}
+-e 
+
+=== FILE: ./internal/types/apperror/postgres.go ===
+package apperror
+
+import (
+	"errors"
+
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// NewPostgresError конвертирует ошибку pgx в кастомную AppError
+func NewPostgresError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Проверка на отсутствия строк в pgx
+	if errors.Is(err, pgx.ErrNoRows) {
+		return NewNotFound("запись не найдена", err)
+	}
+
+	// Проверка на ошибки самого PostgreSQL (нарушение ограничений и т.д.)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+
+		// Дубликат ключа (например, email уже занят)
+		case pgerrcode.UniqueViolation: // Код "23505"
+			return NewConflict("такая запись уже существует", err)
+
+		// Нарушение внешнего ключа (попытка привязать к несуществующей сущности)
+		case pgerrcode.ForeignKeyViolation: // Код "23250"
+			return NewBadRequest("нарушение связности данных (внешний ключ)", err)
+
+		// Нарушение NOT NULL или CHECK ограничений
+		case pgerrcode.NotNullViolation, pgerrcode.CheckViolation:
+			return NewBadRequest("переданы некорректные данные", err)
+
+			// Превышение таймаута выполнения запроса в БД
+			// case pgerrcode.QueryCanceled:
+			// 	return NewTimeout("превышено время ожидания базы данных", err)
+			// }
+		}
+	}
+
+	// 3. Дефолтный ответ для всех остальных непредвиденных ошибок БД
+	return NewInternal("внутренняя ошибка базы данных", err)
+}
+-e 
+
+=== FILE: ./internal/types/apperror/error.go ===
+package apperror
+
+import (
+	"errors"
+	"fmt"
+)
+
+type ErrType string
+
+const (
+	ErrNotFound      ErrType = "NOT_FOUND"
+	ErrBadRequest    ErrType = "BAD_REQUEST"
+	ErrAlreadyExists ErrType = "ALREADY_EXISTS"
+	ErrUnauthorized  ErrType = "UNAUTHORIZED"
+	ErrForbidden     ErrType = "FORBIDDEN"
+	ErrInternal      ErrType = "INTERNAL"
+)
+
+var ErrForbiddenGeneric = errors.New("доступ запрещён")
+
+type AppError struct {
+	Type    ErrType `json:"type"`
+	Message string  `json:"message"`
+	Err     error   `json:"-"`
+}
+
+func (e *AppError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("[%s] %s: %v", e.Type, e.Message, e.Err)
+	}
+	return fmt.Sprintf("[%s] %s", e.Type, e.Message)
+}
+
+func (e *AppError) Unwrap() error {
+	return e.Err
+}
+
+// Конструкторы
+
+func NewNotFound(msg string, err error) error {
+	return &AppError{Type: ErrNotFound, Message: msg, Err: err}
+}
+
+func NewConflict(msg string, err error) error {
+	return &AppError{Type: ErrAlreadyExists, Message: msg, Err: err}
+}
+
+func NewBadRequest(msg string, err error) error {
+	return &AppError{Type: ErrBadRequest, Message: msg, Err: err}
+}
+
+func NewUnauthorized(msg string, err error) error {
+	return &AppError{Type: ErrUnauthorized, Message: msg, Err: err}
+}
+
+func NewForbidden(msg string, err error) error {
+	return &AppError{Type: ErrForbidden, Message: msg, Err: err}
+}
+
+func NewForbiddenWithoutErr() error {
+	return &AppError{Type: ErrForbidden, Message: "нет прав", Err: ErrForbiddenGeneric}
+}
+
+func NewInternal(msg string, err error) error {
+	return &AppError{Type: ErrInternal, Message: msg, Err: err}
+}
+
+// GetType извлекает тип ошибки
+func GetType(err error) ErrType {
+	if err == nil {
+		return ""
+	}
+	var appErr *AppError
+	if errors.As(err, &appErr) {
+		return appErr.Type
+	}
+	return ErrInternal
+}
+-e 
+
+=== FILE: ./internal/types/filterbool/filterbool.go ===
+package filterbool
+
+type FilterBool string
+
+const (
+	FilterBoolTrue  FilterBool = "true"
+	FilterBoolFalse FilterBool = "false"
+	FilterBoolAll   FilterBool = "all"
+)
+
+func (f FilterBool) IsTrue() bool {
+	return f == FilterBoolTrue
+}
+
+func (f FilterBool) IsFalse() bool {
+	return f == FilterBoolFalse
+}
+
+func (f FilterBool) IsAll() bool {
+	return f == FilterBoolAll || f == ""
+}
+
+func (f FilterBool) String() string {
+	return string(f)
+}
+
+func (f FilterBool) IsSet() bool {
+	return f != FilterBoolAll && f != ""
+}
+
+func (f FilterBool) GetBool() *bool {
+	switch f {
+	case FilterBoolTrue:
+		b := true
+		return &b
+	case FilterBoolFalse:
+		b := false
+		return &b
+	default:
+		return nil
+	}
+}
+
+func NewFilterBool(s string) FilterBool {
+	switch s {
+	case "true":
+		return FilterBoolTrue
+	case "false":
+		return FilterBoolFalse
+	default:
+		return FilterBoolAll
+	}
+}
+
+-e 
+
+=== FILE: ./internal/db/postgres.go ===
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/config"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// DBClient объединяет методы pgxpool.Pool и pgx.Tx, неймин методов идентичен
+type DBClient interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Приватный тип ключа для контекста
+type txKey struct{}
+
+type PostgresDB struct {
+	Pool *pgxpool.Pool
+}
+
+func NewPostgresDB(cfg *config.DatabaseConfig) (*PostgresDB, error) {
+	poolConfig, err := pgxpool.ParseConfig(cfg.DSN())
+	if err != nil {
+		return nil, fmt.Errorf("ошибка парсинга DSN: %w", err)
+	}
+
+	poolConfig.MaxConns = cfg.MaxConns
+	poolConfig.MinConns = 2
+	poolConfig.MaxConnLifetime = time.Hour
+	poolConfig.MaxConnIdleTime = 30 * time.Minute
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка создания пула соединений: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("ошибка подключения к БД: %w", err)
+	}
+
+	return &PostgresDB{Pool: pool}, nil
+}
+
+func (db *PostgresDB) Close() error {
+	if db.Pool != nil {
+		db.Pool.Close()
+	}
+	return nil
+}
+
+// WithinTransaction реализует интерфейс domain.Transactor
+func (db *PostgresDB) WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	// Если транзакция уже открыта выше по стеку (вложенный вызов) 
+	// повторно открывать её не нужно — просто выполняем функцию в текущем контексте
+	if _, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
+		return fn(ctx)
+	}
+
+	// Открываем новую транзакцию в pgx
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть транзакцию: %w", err)
+	}
+
+	// Гарантируем откат (Rollback) при возникновении паники или ошибки до вызова Commit
+	// Если транзакция уже закрыта через Commit(), метод Rollback вернет pgx.ErrTxClosed, который мы игнорируем.
+	defer func() {
+		if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			// Здесь можно вызвать логгер, например: logger.Error("rollback error", err)
+		}
+	}()
+
+	// Обогащаем контекст, сохраняя в него открытую транзакцию
+	txCtx := context.WithValue(ctx, txKey{}, tx)
+
+	// Выполняем переданную бизнес-логику. Если внутри fn будет ошибка, возвращаем её.
+	if err := fn(txCtx); err != nil {
+		return err 
+	}
+
+	// Если вся цепочка операций выполнена без ошибок — фиксируем изменения в БД
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("не удалось закоммитить транзакцию: %w", err)
+	}
+
+	return nil
+}
+
+// GetDB проверяет контекст. Если в нем есть активная транзакция — возвращает её.
+// Если транзакции нет — возвращает стандартный пул соединений.
+func (db *PostgresDB) GetDB(ctx context.Context) DBClient {
+	if tx, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
+		return tx
+	}
+	return db.Pool
+}-e 
+
+=== FILE: ./internal/handler/permission.go ===
+package handler
+
+import (
+	"net/http"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+type permissionHandler struct {
+	permissionService domain.PermissionService
+	validate          *validator.Validate
+}
+
+func NewPermissionHandler(r chi.Router, authMW *middleware.AuthMiddleware, permissionService domain.PermissionService) {
+	h := &permissionHandler{
+		permissionService: permissionService,
+		validate:          validator.New(),
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth, authMW.RequireAdmin)
+		r.Get("/api/v1/roles/{id}/permissions", h.GetPermissions)
+		r.Put("/api/v1/roles/{id}/permissions", h.UpdatePermissions)
+	})
+}
+
+func (h *permissionHandler) GetPermissions(w http.ResponseWriter, r *http.Request) {
+	roleID, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	perms, err := h.permissionService.GetForRole(r.Context(), roleID)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, perms)
+}
+
+func (h *permissionHandler) UpdatePermissions(w http.ResponseWriter, r *http.Request) {
+	roleID, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	req, err := httputils.DecodeJSONBodyWithValidate[dto.UpdatePermissionsRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	// Преобразуем DTO в доменные объекты
+	targets := make([]domain.PermissionTarget, len(req.Permissions))
+	for i, p := range req.Permissions {
+		targets[i] = domain.PermissionTarget{
+			EntityName: p.EntityName,
+			ActionName: p.ActionName,
+		}
+	}
+
+	if err := h.permissionService.ReplacePermissions(r.Context(), roleID, targets); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "права обновлены"})
+}-e 
+
+=== FILE: ./internal/handler/department.go ===
+package handler
+
+import (
+	"net/http"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+type departmentHandler struct {
+	departmentService domain.DepartmentService
+	validate          *validator.Validate
+}
+
+func NewDepartmentHandler(r chi.Router, authMW *middleware.AuthMiddleware, departmentService domain.DepartmentService) {
+	h := departmentHandler{
+		departmentService: departmentService,
+		validate:          validator.New(),
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth)
+		r.Get("/api/v1/departments", h.GetList)
+		r.Post("/api/v1/departments", h.Create)
+		r.Get("/api/v1/departments/{id}", h.GetByID)
+		r.Put("/api/v1/departments/{id}", h.Update)
+		r.Delete("/api/v1/departments/{id}", h.SoftDelete)
+	})
+
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth, authMW.RequireAdmin)
+		r.Delete("/api/v1/departments/{id}/hard", h.HardDelete)
+	})
+}
+
+func (d *departmentHandler) GetList(w http.ResponseWriter, r *http.Request) {
+	paginationRequest := httputils.ParsePagination(r)
+
+	// Получаем значение и проверяем, что оно не пустое
+	nameFilter, ok := httputils.GetQueryValueWithExist(r, "name")
+	if ok && nameFilter == "" {
+		nameFilter = ""
+	} else if !ok {
+		nameFilter = ""
+	}
+
+	departments, err := d.departmentService.GetList(r.Context(), domain.DepartmentFilter{
+		Name:       nameFilter,
+		Pagination: paginationRequest,
+	})
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	// Преобразуем домен в DTO
+	deptDTOs := dto.DepartmentsToResponseSlice(departments.Data)
+	response := dto.NewPagedResponse(deptDTOs, departments.Pagination)
+
+	httputils.WriteOk(w, response)
+}
+
+func (d *departmentHandler) GetByID(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	department, err := d.departmentService.GetByID(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.DepartmentToResponse(department))
+}
+
+func (d *departmentHandler) Create(w http.ResponseWriter, r *http.Request) {
+	departmentCreateRequest, err := httputils.DecodeJSONBodyWithValidate[dto.DepartmentCreateRequest](r, d.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	department := domain.Department{
+		Name: departmentCreateRequest.Name,
+	}
+
+	if err := d.departmentService.Create(r.Context(), &department); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.DepartmentToResponse(&department))
+}
+
+func (d *departmentHandler) Update(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	departmentUpdateRequest, err := httputils.DecodeJSONBodyWithValidate[dto.DepartmentUpdateRequest](r, d.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	department, err := d.departmentService.GetByID(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	department.Name = departmentUpdateRequest.Name
+
+	if err := d.departmentService.Update(r.Context(), department); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.DepartmentToResponse(department))
+}
+
+func (d *departmentHandler) HardDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := d.departmentService.HardDelete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "запись полностью удалена"})
+}
+
+func (d *departmentHandler) SoftDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := d.departmentService.SoftDelete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "запись помечена как удалённая"})
+}
+-e 
+
+=== FILE: ./internal/handler/auth.go ===
+package handler
+
+import (
+	"net/http"
+
+	"github.com/Voltage11/tplatform/internal/appcontext"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/Voltage11/tplatform/internal/service"
+	"github.com/Voltage11/tplatform/pkg/logger"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+type authHandler struct {
+	authService *service.AuthService
+	userService domain.UserService
+	logger      logger.Logger
+	validate    *validator.Validate
+}
+
+func NewAuthHandlers(r chi.Router, authMW *middleware.AuthMiddleware, authService *service.AuthService, userService domain.UserService, log logger.Logger) {
+	h := authHandler{
+		authService: authService,
+		userService: userService,
+		logger:      log,
+		validate:    validator.New(),
+	}
+
+	// Публичные маршруты
+	r.Post("/api/v1/auth/login", h.Login)
+	r.Post("/api/v1/auth/refresh", h.Refresh)
+	r.Post("/api/v1/auth/logout", h.Logout)
+
+	// Защищенные маршруты
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth) // Любая авторизация принимается, не важно админ или нет
+		r.Get("/api/v1/profile", h.Profile)
+	})
+}
+
+func (a *authHandler) Login(w http.ResponseWriter, r *http.Request) {
+	loginRequest, err := httputils.DecodeJSONBodyWithValidate[dto.LoginRequest](r, a.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	token, err := a.authService.Login(r.Context(), loginRequest.Email, loginRequest.Password, r.UserAgent(), r.RemoteAddr)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.AuthResponse{
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		ExpiresIn:    token.ExpiresIn,
+	})
+}
+
+func (a *authHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+	refreshRequest, err := httputils.DecodeJSONBodyWithValidate[dto.RefreshRequest](r, a.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	tokenPair, err := a.authService.Refresh(r.Context(), refreshRequest.RefreshToken)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteJSON(w, http.StatusOK, dto.AuthResponse{
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresIn:    tokenPair.ExpiresIn,
+	})
+}
+
+func (a *authHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	logoutRequest, err := httputils.DecodeJSONBodyWithValidate[dto.LogoutRequest](r, a.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := a.authService.Logout(r.Context(), logoutRequest.RefreshToken); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "успешно вышли из системы"})
+}
+
+// Profile возвращает информацию о текущем пользователе
+func (a *authHandler) Profile(w http.ResponseWriter, r *http.Request) {
+	user := appcontext.GetUserFromContext(r.Context())
+	if user == nil {
+		httputils.WriteErrorString(w, http.StatusUnauthorized, "пользователь не авторизован")
+		return
+	}
+
+	userWithDetail, err := a.userService.GetByIDWithDetail(r.Context(), user.ID)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteJSON(w, http.StatusOK, map[string]any{
+		"user": dto.UserToResponse(userWithDetail),
+	})
+}
+-e 
+
+=== FILE: ./internal/handler/role.go ===
+package handler
+
+import (
+	"net/http"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+type roleHandler struct {
+    roleService domain.RoleService
+    validate    *validator.Validate
+}
+
+func NewRoleHandler(r chi.Router, authMW *middleware.AuthMiddleware, roleService domain.RoleService) {
+    h := roleHandler{
+        roleService: roleService,
+        validate:    validator.New(),
+    }
+
+    r.Group(func(r chi.Router) {
+        r.Use(authMW.RequireAuth)
+        r.Get("/api/v1/roles", h.GetList)
+        r.Post("/api/v1/roles", h.Create)
+        r.Put("/api/v1/roles/{id}", h.Update)
+        r.Delete("/api/v1/roles/{id}", h.Delete)
+    })
+}
+
+func (h *roleHandler) Create(w http.ResponseWriter, r *http.Request) {
+    req, err := httputils.DecodeJSONBodyWithValidate[dto.RoleCreateRequest](r, h.validate)
+    if err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    role := domain.Role{
+        Name:        req.Name,
+        Description: req.Description,
+    }
+
+    if err := h.roleService.Create(r.Context(), &role); err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    httputils.WriteOk(w, dto.RoleToResponse(&role))
+}
+
+func (h *roleHandler) Update(w http.ResponseWriter, r *http.Request) {
+    id, err := httputils.ParseUUID(r, "id")
+    if err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    req, err := httputils.DecodeJSONBodyWithValidate[dto.RoleUpdateRequest](r, h.validate)
+    if err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    role, err := h.roleService.GetByID(r.Context(), id)
+    if err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    role.Name = req.Name
+    role.Description = req.Description
+
+    if err := h.roleService.Update(r.Context(), role); err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    httputils.WriteOk(w, dto.RoleToResponse(role))
+}
+
+func (h *roleHandler) Delete(w http.ResponseWriter, r *http.Request) {
+    id, err := httputils.ParseUUID(r, "id")
+    if err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    if err := h.roleService.Delete(r.Context(), id); err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    httputils.WriteOk(w, map[string]string{"message": "Роль удалена"})
+}
+
+func (h *roleHandler) GetList(w http.ResponseWriter, r *http.Request) {
+    paginationRequest := httputils.ParsePagination(r)
+
+    // Безопасное получение фильтра по имени
+    nameFilter, ok := httputils.GetQueryValueWithExist(r, "name")
+    if ok && nameFilter == "" {
+        nameFilter = "" // игнорируем пустой параметр
+    } else if !ok {
+        nameFilter = ""
+    }
+
+    roleFilter := domain.RoleFilter{
+        Name:       nameFilter,
+        Pagination: paginationRequest,
+    }
+
+    rolesDomain, err := h.roleService.GetList(r.Context(), roleFilter)
+    if err != nil {
+        httputils.WriteError(w, err)
+        return
+    }
+
+    // Преобразуем в DTO
+    roleDTOs := dto.RolesToResponseSlice(rolesDomain.Data)
+    response := dto.NewPagedResponse(roleDTOs, rolesDomain.Pagination)
+
+    httputils.WriteOk(w, response)
+}-e 
+
+=== FILE: ./internal/handler/dto/permission.go ===
+package dto
+
+// UpdatePermissionsRequest – тело запроса PUT /api/v1/roles/{id}/permissions
+type UpdatePermissionsRequest struct {
+	Permissions []PermissionItem `json:"permissions" validate:"required,dive"`
+}
+
+// PermissionItem – одна пара сущность‑действие
+type PermissionItem struct {
+	EntityName string `json:"entity_name" validate:"required"`
+	ActionName string `json:"action_name" validate:"required"`
+}-e 
+
+=== FILE: ./internal/handler/dto/department.go ===
+package dto
+
+import (
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+)
+
+type DepartmentCreateRequest struct {
+	Name string `json:"name" validate:"required,min=3"`
+}
+
+type DepartmentUpdateRequest struct {
+	Name string `json:"name" validate:"required,min=3"`
+}
+
+type DepartmentResponse struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func DepartmentToResponse(department *domain.Department) *DepartmentResponse {
+	return &DepartmentResponse{
+		ID:        department.ID.String(),
+		Name:      department.Name,
+		CreatedAt: department.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: department.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func DepartmentsToResponseSlice(departments []*domain.Department) []*DepartmentResponse {
+	if departments == nil {
+		return nil
+	}
+
+	out := make([]*DepartmentResponse, len(departments))
+	for i, department := range departments {
+		out[i] = DepartmentToResponse(department)
+	}
+	return out
+}
+-e 
+
+=== FILE: ./internal/handler/dto/auth.go ===
+package dto
+
+// LoginRequest запрос на вход
+type LoginRequest struct {
+	Email    string `json:"email" validate:"required,email"`
+	Password string `json:"password" validate:"required,min=6"`
+}
+
+// AuthResponse ответ с токенами
+type AuthResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+}
+
+// RefreshRequest запрос на обновление токенов
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token" validate:"required"`
+}
+
+// LogoutRequest запрос на выход
+type LogoutRequest struct {
+	RefreshToken string `json:"refresh_token" validate:"required"`
+}-e 
+
+=== FILE: ./internal/handler/dto/role.go ===
+package dto
+
+import (
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+)
+
+type RoleCreateRequest struct {
+	Name        string `json:"name" validate:"required,min=3"`
+	Description string `json:"description,omitempty"`
+}
+
+type RoleUpdateRequest struct {
+	Name        string `json:"name" validate:"required,min=3"`
+	Description string `json:"description,omitempty"`
+}
+
+type RoleResponse struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	CreatedAt   string `json:"created_at"`
+}
+
+func RoleToResponse(role *domain.Role) *RoleResponse {
+	return &RoleResponse{
+		ID:          role.ID.String(),
+		Name:        role.Name,
+		Description: role.Description,
+		CreatedAt:   role.CreatedAt.Format(time.RFC3339),
+	}
+}
+
+func RolesToResponseSlice(roles []*domain.Role) []*RoleResponse {
+	if roles == nil {
+		return nil
+	}
+
+	out := make([]*RoleResponse, len(roles))
+	for i, role := range roles {
+		out[i] = RoleToResponse(role)
+	}
+	return out
+}
+-e 
+
+=== FILE: ./internal/handler/dto/user.go ===
+package dto
+
+import (
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+)
+
+// ---------- Запросы ----------
+
+type UserCreateRequest struct {
+	FirstName    string  `json:"first_name" validate:"required,min=1"`
+	SecondName   *string `json:"second_name,omitempty"`
+	LastName     string  `json:"last_name" validate:"required,min=1"`
+	Email        string  `json:"email" validate:"required,email"`
+	Password     string  `json:"password" validate:"required,min=6"`
+	DepartmentID *string `json:"department_id,omitempty" validate:"omitempty,uuid4"`
+	RoleID       *string `json:"role_id,omitempty" validate:"omitempty,uuid4"`
+	IsActive     *bool   `json:"is_active,omitempty"`
+	IsAdmin      *bool   `json:"is_admin,omitempty"`
+}
+
+type UserUpdateRequest struct {
+	FirstName    *string `json:"first_name,omitempty"`
+	SecondName   *string `json:"second_name,omitempty"`
+	LastName     *string `json:"last_name,omitempty"`
+	Email        *string `json:"email,omitempty" validate:"omitempty,email"`
+	DepartmentID *string `json:"department_id,omitempty" validate:"omitempty,uuid4"`
+	RoleID       *string `json:"role_id,omitempty" validate:"omitempty,uuid4"`
+	IsActive     *bool   `json:"is_active,omitempty"`
+	IsAdmin      *bool   `json:"is_admin,omitempty"`
+}
+
+type UserSetActiveRequest struct {
+	IsActive bool `json:"is_active"`
+}
+
+// ---------- Ответы ----------
+
+type UserResponse struct {
+	ID         string              `json:"id"`
+	FirstName  string              `json:"first_name"`
+	SecondName *string             `json:"second_name,omitempty"`
+	LastName   string              `json:"last_name"`
+	Email      string              `json:"email"`
+	Department *DepartmentResponse `json:"department,omitempty"`
+	Role       *RoleResponse       `json:"role,omitempty"`
+	IsActive   bool                `json:"is_active"`
+	IsAdmin    bool                `json:"is_admin"`
+	CreatedAt  string              `json:"created_at"`
+	UpdatedAt  string              `json:"updated_at"`
+}
+
+// UserToResponse конвертирует доменную модель (с деталями) в DTO
+func UserToResponse(u *domain.UserWithDetail) *UserResponse {
+	if u == nil {
+		return nil
+	}
+
+	resp := &UserResponse{
+		ID:        u.ID.String(),
+		FirstName: u.FirstName,
+		LastName:  u.LastName,
+		Email:     u.Email,
+		IsActive:  u.IsActive,
+		IsAdmin:   u.IsAdmin,
+		CreatedAt: u.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: u.UpdatedAt.Format(time.RFC3339),
+	}
+
+	if u.SecondName != "" {
+		resp.SecondName = &u.SecondName
+	}
+
+	if u.Department != nil {
+		resp.Department = &DepartmentResponse{
+			ID:   u.Department.ID.String(),
+			Name: u.Department.Name,
+		}
+	}
+
+	if u.Role != nil {
+		resp.Role = &RoleResponse{
+			ID:   u.Role.ID.String(),
+			Name: u.Role.Name,
+		}
+	}
+
+	return resp
+}
+
+// UsersToResponseSlice конвертирует список пользователей
+func UsersToResponseSlice(users []*domain.UserWithDetail) []*UserResponse {
+	if users == nil {
+		return nil
+	}
+	out := make([]*UserResponse, len(users))
+	for i, u := range users {
+		out[i] = UserToResponse(u)
+	}
+	return out
+}
+
+type UserShortResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+-e 
+
+=== FILE: ./internal/handler/dto/pagination.go ===
+package dto
+
+import "github.com/Voltage11/tplatform/internal/domain"
+
+// PagedResponse – универсальная обёртка для списков с пагинацией
+type PagedResponse[T any] struct {
+    Data       []T                     `json:"data"`
+    Pagination domain.PaginationResponse `json:"pagination"`
+}
+
+func NewPagedResponse[T any](data []T, pagination domain.PaginationResponse) *PagedResponse[T] {
+    return &PagedResponse[T]{
+        Data:       data,
+        Pagination: pagination,
+    }
+}-e 
+
+=== FILE: ./internal/handler/dto/theme.go ===
+package dto
+
+import (
+    "time"
+
+    "github.com/Voltage11/tplatform/internal/domain"
+)
+
+type ThemeCreateRequest struct {
+    Name        string     `json:"name" validate:"required,min=3"`
+    Description string     `json:"description,omitempty"`
+    IsActive    bool       `json:"is_active"`
+    DateBegin   *time.Time `json:"date_begin,omitempty"`
+    DateEnd     *time.Time `json:"date_end,omitempty"`
+    CheckPoint  int        `json:"check_point"`
+    ImgPath     string     `json:"img_path,omitempty"`
+}
+
+type ThemeUpdateRequest struct {
+    Name        string     `json:"name" validate:"required,min=3"`
+    Description string     `json:"description,omitempty"`
+    IsActive    bool       `json:"is_active"`
+    DateBegin   *time.Time `json:"date_begin,omitempty"`
+    DateEnd     *time.Time `json:"date_end,omitempty"`
+    CheckPoint  int        `json:"check_point"`
+    ImgPath     string     `json:"img_path,omitempty"`
+}
+
+type ThemeResponse struct {
+    ID          string `json:"id"`
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    IsActive    bool   `json:"is_active"`
+    CreatedByID string `json:"created_by_id"`
+    CreatedAt   string `json:"created_at"`
+    DateBegin   string `json:"date_begin"`
+    DateEnd     string `json:"date_end"`
+    MaxPoint    int    `json:"max_point"`
+    CheckPoint  int    `json:"check_point"`
+    ImgPath     string `json:"img_path"`
+}
+
+type ThemeWithDetailResponse struct {
+    ID          string `json:"id"`
+    Name        string `json:"name"`
+    Description string `json:"description"`
+    IsActive    bool   `json:"is_active"`
+    CreatedByID string `json:"created_by_id"`
+    CreatedAt   string `json:"created_at"`
+    DateBegin   string `json:"date_begin"`
+    DateEnd     string `json:"date_end"`
+    MaxPoint    int    `json:"max_point"`
+    CheckPoint  int    `json:"check_point"`
+    ImgPath     string `json:"img_path"`
+    CreatedBy   UserShortResponse `json:"created_by"`
+}
+
+func ThemeToResponse(theme *domain.ThemeWithDetail) *ThemeWithDetailResponse {
+    var dateBegin, dateEnd string
+    if theme.DateBegin != nil {
+        dateBegin = theme.DateBegin.Format(time.RFC3339)
+    }
+    if theme.DateEnd != nil {
+        dateEnd = theme.DateEnd.Format(time.RFC3339)
+    }
+
+    return &ThemeWithDetailResponse{
+        ID:          theme.ID.String(),
+        Name:        theme.Name,
+        Description: theme.Description,
+        IsActive:    theme.IsActive,
+        CreatedByID: theme.CreatedByID.String(),
+        CreatedAt:   theme.CreatedAt.Format(time.RFC3339),
+        DateBegin:   dateBegin,
+        DateEnd:     dateEnd,
+        MaxPoint:    theme.MaxPoint,
+        CheckPoint:  theme.CheckPoint,
+        ImgPath:     theme.ImgPath,
+        CreatedBy: UserShortResponse{
+            ID:   theme.CreatedBy.ID.String(),
+            Name: theme.CreatedBy.Name,
+        },
+    }
+}
+
+func ThemesToResponseSlice(themes []*domain.ThemeWithDetail) []*ThemeWithDetailResponse {
+    if themes == nil {
+        return nil
+    }
+    out := make([]*ThemeWithDetailResponse, len(themes))
+    for i, item := range themes {
+        out[i] = ThemeToResponse(item)
+    }
+    return out
+}-e 
+
+=== FILE: ./internal/handler/dto/question.go ===
+package dto
+
+import (
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+)
+
+type QuestionCreateRequest struct {
+	QuestionType string `json:"question_type" validate:"required"`
+	Name         string `json:"name" validate:"required,min=3"`
+	PointCorrect int    `json:"point_correct"`
+}
+
+func (q *QuestionCreateRequest) Validate() error {
+	if q.QuestionType != domain.QuestionTypeMulti.String() || q.QuestionType != domain.QuestionTypeSingle.String() {
+		return apperror.NewBadRequest("Тип вопроса может иметь два значения: single, multi", nil)
+	}
+
+	return nil
+}
+
+func GetQuestionTypeFromStr(name string) domain.QuestionType {
+	if name == "single" {
+		return domain.QuestionTypeSingle
+	}
+
+	if name == "multi" {
+		return domain.QuestionTypeMulti
+	}
+
+	return domain.QuestionTypeSingle
+}
+
+type QuestionUpdateRequest struct {
+	QuestionType string `json:"question_type" validate:"required"`
+	Name         string `json:"name" validate:"required,min=3"`
+	PointCorrect int    `json:"point_correct"`
+}
+
+func (q *QuestionUpdateRequest) Validate() error {
+	if q.QuestionType != domain.QuestionTypeMulti.String() || q.QuestionType != domain.QuestionTypeSingle.String() {
+		return apperror.NewBadRequest("Тип вопроса может иметь два значения: single, multi", nil)
+	}
+
+	return nil
+}
+
+type QuestionSetOrderRequest struct{
+	SortOrder    int    `json:"sort_order" validate:"required"`
+}
+
+type QuestionResponse struct {
+	ID           string `json:"id"`
+	ThemeID      string `json:"theme_id"`
+	QuestionType string `json:"question_type"`
+	Name         string `json:"name"`
+	PointCorrect int    `json:"point_correct"`
+	SortOrder    int    `json:"sort_order"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+}
+
+func QuestionToResponse(question *domain.Question) *QuestionResponse {
+	return &QuestionResponse{
+		ID: question.ID.String(),
+		ThemeID: question.ThemeID.String(),
+		QuestionType: string(question.QuestionType),
+		Name: question.Name,
+		PointCorrect: question.PointCorrect,
+		SortOrder: question.SortOrder,
+		CreatedAt: question.CreatedAt.Format(time.RFC3339Nano),
+		UpdatedAt: question.UpdatedAt.Format(time.RFC3339Nano),
+	}
+}
+
+func  QuestionsToResponseSlice(questions []*domain.Question) []*QuestionResponse {
+	out := make([]*QuestionResponse, len(questions))
+
+	for i, item := range questions {
+		out[i] = QuestionToResponse(item)
+	}
+
+	return  out
+}-e 
+
+=== FILE: ./internal/handler/httputils/json.go ===
+package httputils
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/go-playground/validator/v10"
+)
+
+const maxBodySize = 1_048_576 // 1 MB
+
+// DecodeJSONBody читает тело запроса, ограничивает размер и десериализует JSON
+// Возвращает указатель на готовый объект или ошибку
+func DecodeJSONBody[T any](r *http.Request) (*T, error) {
+    // Ограничиваем размер во избежание атак
+    r.Body = http.MaxBytesReader(nil, r.Body, maxBodySize)
+
+    var obj T
+
+    decoder := json.NewDecoder(r.Body)    
+
+    if err := decoder.Decode(&obj); err != nil {
+        var syntaxErr *json.SyntaxError
+        var unmarshalTypeErr *json.UnmarshalTypeError
+
+        switch {
+        case errors.Is(err, io.EOF):
+            return nil, apperror.NewBadRequest("тело запроса пустое", err)
+        case errors.As(err, &syntaxErr):
+            return nil, apperror.NewBadRequest("некорректный JSON", err)
+        case errors.As(err, &unmarshalTypeErr):
+            return nil, apperror.NewBadRequest(
+                "неверный тип поля "+unmarshalTypeErr.Field, err,
+            )
+        case err.Error() == "http: request body too large":
+            return nil, apperror.NewBadRequest("тело запроса превышает допустимый размер", err)
+        default:
+            return nil, apperror.NewBadRequest("ошибка разбора JSON", err)
+        }
+    }
+    
+    if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+        return nil, apperror.NewBadRequest("тело запроса содержит лишние данные", err)
+    }
+
+    return &obj, nil
+}
+
+func DecodeJSONBodyWithValidate[T any](r *http.Request, validate *validator.Validate) (*T, error) {
+    out, err := DecodeJSONBody[T](r)
+    if err != nil {
+        return nil, err
+    }
+
+    if err := validate.Struct(out); err != nil {		
+		return nil, err
+	}
+
+    return out, nil
+}-e 
+
+=== FILE: ./internal/handler/httputils/helpers.go ===
+package httputils
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/Voltage11/tplatform/internal/types/filterbool"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+)
+
+// WriteJSON отправляет JSON-ответ с заданным статусом
+func WriteJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+// WriteOk успешный ответ
+func WriteOk(w http.ResponseWriter, data any) {
+	WriteJSON(w, http.StatusOK, data)
+}
+
+// WriteErrorString отправляет ошибку в формате JSON
+func WriteErrorString(w http.ResponseWriter, code int, message string) {
+	WriteJSON(w, code, map[string]string{"error": message})
+}
+
+// WriteError отправляет ошибку в формате JSON
+func WriteError(w http.ResponseWriter, err error) {
+	var code int
+	var message string
+
+	if validationErrs, ok := err.(validator.ValidationErrors); ok {
+		code = http.StatusBadRequest
+		message = validationErrs.Error()
+	} else if appErr, ok := err.(*apperror.AppError); ok {
+		code = apperror.HTTPStatusFromError(appErr)
+		message = appErr.Message
+	} else {
+		code = http.StatusInternalServerError
+		message = err.Error()
+	}
+
+	WriteJSON(w, code, map[string]string{"error": message})
+}
+
+// ParseUUID извлекает и валидирует UUID из параметра URL
+func ParseUUID(r *http.Request, paramName string) (uuid.UUID, error) {
+	idStr := chi.URLParam(r, paramName)
+	return uuid.Parse(idStr)
+}
+
+// ParsePagination извлекает page и limit из query-параметров
+func ParsePagination(r *http.Request) domain.PaginationRequest {
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil {
+		page = 1
+	}
+
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil {
+		limit = 100
+	}
+
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	return domain.PaginationRequest{Page: page, Limit: limit}
+}
+
+func GetQueryValue(r *http.Request, key string) string {
+	return r.URL.Query().Get(key)
+}
+
+func GetQueryValueWithExist(r *http.Request, key string) (string, bool) {
+	ok := r.URL.Query().Has(key)
+
+	if !ok {
+		return "", false
+	}
+
+	return r.URL.Query().Get(key), true
+}
+
+func GetQueryValueInt(r *http.Request, key string) (int, bool) {
+	valueStr, ok := GetQueryValueWithExist(r, key)
+
+	if !ok {
+		return 0, false
+	}
+
+	valueInt, err := strconv.Atoi(valueStr)
+	if err != nil {
+		return 0, false
+	}
+
+	return valueInt, true
+}
+
+func ParseFilterBool(r *http.Request, key string) filterbool.FilterBool {
+	val, ok := GetQueryValueWithExist(r, key)
+	if !ok {
+		return filterbool.FilterBoolAll
+	}
+	switch val {
+	case "true":
+		return filterbool.FilterBoolTrue
+	case "false":
+		return filterbool.FilterBoolFalse
+	default:
+		return filterbool.FilterBoolAll
+	}
+}
+
+func ParseUUIDQuery(r *http.Request, key string) *uuid.UUID {
+	val, ok := GetQueryValueWithExist(r, key)
+	if !ok || val == "" {
+		return nil
+	}
+	id, err := uuid.Parse(val)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+-e 
+
+=== FILE: ./internal/handler/user.go ===
+package handler
+
+import (
+	"net/http"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+)
+
+type userHandler struct {
+	userService domain.UserService
+	validate    *validator.Validate
+}
+
+func NewUserHandler(r chi.Router, authMW *middleware.AuthMiddleware, userService domain.UserService) {
+	h := userHandler{
+		userService: userService,
+		validate:    validator.New(),
+	}
+
+	// Чтение доступно любым авторизованным пользователям с правом view
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth)
+		r.Get("/api/v1/users", h.GetList)
+		r.Get("/api/v1/users/{id}", h.GetByID)
+	})
+
+	// Запись доступна только администраторам
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth, authMW.RequireAdmin)
+		r.Post("/api/v1/users", h.Create)
+		r.Put("/api/v1/users/{id}", h.Update)
+		r.Delete("/api/v1/users/{id}", h.SoftDelete)
+		r.Delete("/api/v1/users/{id}/permanent", h.HardDelete)
+		r.Patch("/api/v1/users/{id}/active", h.SetActive)
+	})
+}
+
+func (h *userHandler) GetList(w http.ResponseWriter, r *http.Request) {
+	pagination := httputils.ParsePagination(r)
+
+	filter := domain.UserFilter{
+		FirstName:    httputils.GetQueryValue(r, "first_name"),
+		SecondName:   httputils.GetQueryValue(r, "second_name"),
+		LastName:     httputils.GetQueryValue(r, "last_name"),
+		Email:        httputils.GetQueryValue(r, "email"),
+		DepartmentID: httputils.ParseUUIDQuery(r, "department_id"),
+		RoleID:       httputils.ParseUUIDQuery(r, "role_id"),
+		IsActive:     httputils.ParseFilterBool(r, "is_active"),
+		Pagination:   pagination,
+	}
+
+	result, err := h.userService.GetList(r.Context(), filter)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	usersDTO := dto.UsersToResponseSlice(result.Data)
+	response := dto.NewPagedResponse(usersDTO, result.Pagination)
+	httputils.WriteOk(w, response)
+}
+
+func (h *userHandler) GetByID(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	user, err := h.userService.GetByIDWithDetail(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.UserToResponse(user))
+}
+
+// ---------- Операции (только для админов) ----------
+
+func (h *userHandler) Create(w http.ResponseWriter, r *http.Request) {
+	req, err := httputils.DecodeJSONBodyWithValidate[dto.UserCreateRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	user := domain.User{
+		FirstName:    req.FirstName,
+		LastName:     req.LastName,
+		Email:        req.Email,
+		PasswordHash: req.Password, // в сервисе преобразуется в хеш
+	}
+
+	if req.SecondName != nil {
+		user.SecondName = *req.SecondName
+	}
+	if req.DepartmentID != nil {
+		id, err := uuid.Parse(*req.DepartmentID)
+		if err == nil {
+			user.DepartmentID = &id
+		}
+	}
+	if req.RoleID != nil {
+		id, err := uuid.Parse(*req.RoleID)
+		if err == nil {
+			user.RoleID = &id
+		}
+	}
+	if req.IsActive != nil {
+		user.IsActive = *req.IsActive
+	} else {
+		user.IsActive = true // по умолчанию активен
+	}
+	if req.IsAdmin != nil {
+		user.IsAdmin = *req.IsAdmin
+	}
+
+	if err := h.userService.Create(r.Context(), &user); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	// После создания возвращаем полную информацию через GetByIDWithDetail
+	created, err := h.userService.GetByIDWithDetail(r.Context(), user.ID)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+	httputils.WriteJSON(w, http.StatusCreated, dto.UserToResponse(created))
+}
+
+func (h *userHandler) Update(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	req, err := httputils.DecodeJSONBodyWithValidate[dto.UserUpdateRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	// Получаем существующего пользователя (с деталями не обязательно, достаточно базовой модели)
+	existing, err := h.userService.GetByID(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	// Применяем только переданные поля
+	if req.FirstName != nil {
+		existing.FirstName = *req.FirstName
+	}
+	if req.SecondName != nil {
+		existing.SecondName = *req.SecondName
+	}
+	if req.LastName != nil {
+		existing.LastName = *req.LastName
+	}
+	if req.Email != nil {
+		existing.Email = *req.Email
+	}
+	if req.DepartmentID != nil {
+		if *req.DepartmentID == "" {
+			existing.DepartmentID = nil
+		} else {
+			depID, err := uuid.Parse(*req.DepartmentID)
+			if err == nil {
+				existing.DepartmentID = &depID
+			}
+		}
+	}
+	if req.RoleID != nil {
+		if *req.RoleID == "" {
+			existing.RoleID = nil
+		} else {
+			roleID, err := uuid.Parse(*req.RoleID)
+			if err == nil {
+				existing.RoleID = &roleID
+			}
+		}
+	}
+	if req.IsActive != nil {
+		existing.IsActive = *req.IsActive
+	}
+	if req.IsAdmin != nil {
+		existing.IsAdmin = *req.IsAdmin
+	}
+
+	if err := h.userService.Update(r.Context(), existing); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	// Возвращаем обновлённого пользователя с деталями
+	updated, err := h.userService.GetByIDWithDetail(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+	httputils.WriteOk(w, dto.UserToResponse(updated))
+}
+
+func (h *userHandler) SoftDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := h.userService.SoftDelete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "пользователь помечен удалённым"})
+}
+
+func (h *userHandler) HardDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := h.userService.HardDelete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "пользователь удалён"})
+}
+
+func (h *userHandler) SetActive(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	req, err := httputils.DecodeJSONBodyWithValidate[dto.UserSetActiveRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := h.userService.SetIsActive(r.Context(), id, req.IsActive); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "статус активности изменён"})
+}-e 
+
+=== FILE: ./internal/handler/theme.go ===
+package handler
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/dto"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+)
+
+type themeHandlers struct {
+	themeService    domain.ThemeService
+	questionService domain.QuestionService
+	validate        *validator.Validate
+}
+
+func NewThemeHandlers(r chi.Router, authMW *middleware.AuthMiddleware, themeService domain.ThemeService, questionService domain.QuestionService) {
+	h := themeHandlers{
+		themeService:    themeService,
+		questionService: questionService,
+		validate:        validator.New(),
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireAuth) // все действия требуют авторизацию
+		r.Get("/api/v1/themes", h.GetList)
+		r.Post("/api/v1/themes", h.Create)
+		r.Put("/api/v1/themes/{id}", h.Update)
+		r.Delete("/api/v1/themes/{id}", h.Delete)
+
+		r.Get("/api/v1/themes/{theme_id}/questions", h.GetQuestions)
+		r.Post("/api/v1/themes/{theme_id}/questions", h.CreateQuestion)
+		r.Put("/api/v1/themes/{theme_id}/questions/{id}", h.UpdateQuestion)
+		r.Delete("/api/v1/themes/{theme_id}/questions/{id}", h.DeleteQuestion)
+		r.Patch("/api/v1/themes/{theme_id}/questions/{id}", h.ChangeSortQuestion)
+	})
+}
+
+func (h *themeHandlers) GetList(w http.ResponseWriter, r *http.Request) {
+	pagination := httputils.ParsePagination(r)
+	name := httputils.GetQueryValue(r, "name")
+
+	var createdAtFrom, createdAtTo *time.Time
+	if fromStr, ok := httputils.GetQueryValueWithExist(r, "created_at_from"); ok && fromStr != "" {
+		t, err := time.Parse(time.RFC3339, fromStr)
+		if err == nil {
+			createdAtFrom = &t
+		}
+	}
+	if toStr, ok := httputils.GetQueryValueWithExist(r, "created_at_to"); ok && toStr != "" {
+		t, err := time.Parse(time.RFC3339, toStr)
+		if err == nil {
+			createdAtTo = &t
+		}
+	}
+
+	isActive := httputils.ParseFilterBool(r, "is_active")
+	createdByID := httputils.ParseUUIDQuery(r, "created_by_id")
+
+	filter := domain.ThemeFilter{
+		Name:          name,
+		IsActive:      isActive,
+		CreatedByID:   createdByID,
+		CreatedAtFrom: createdAtFrom,
+		CreatedAtTo:   createdAtTo,
+		Pagination:    pagination,
+	}
+
+	themes, err := h.themeService.GetList(r.Context(), filter)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	themesDTO := dto.ThemesToResponseSlice(themes.Data)
+	response := dto.NewPagedResponse(themesDTO, themes.Pagination)
+	httputils.WriteOk(w, response)
+}
+
+func (h *themeHandlers) Create(w http.ResponseWriter, r *http.Request) {
+	req, err := httputils.DecodeJSONBodyWithValidate[dto.ThemeCreateRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	theme := domain.Theme{
+		Name:        req.Name,
+		Description: req.Description,
+		IsActive:    req.IsActive,
+		DateBegin:   req.DateBegin,
+		DateEnd:     req.DateEnd,
+		CheckPoint:  req.CheckPoint,
+		ImgPath:     req.ImgPath,
+	}
+
+	if err := h.themeService.Create(r.Context(), &theme); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	themeWithDetail, err := h.themeService.GetByIDWithDetail(r.Context(), theme.ID)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.ThemeToResponse(themeWithDetail))
+}
+
+func (h *themeHandlers) Update(w http.ResponseWriter, r *http.Request) {
+	req, err := httputils.DecodeJSONBodyWithValidate[dto.ThemeUpdateRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	theme, err := h.themeService.GetByID(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	theme.Name = req.Name
+	theme.Description = req.Description
+	theme.IsActive = req.IsActive
+	theme.DateBegin = req.DateBegin
+	theme.DateEnd = req.DateEnd
+	theme.CheckPoint = req.CheckPoint
+	theme.ImgPath = req.ImgPath
+
+	if err := h.themeService.Update(r.Context(), theme); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	themeWithDetail, err := h.themeService.GetByIDWithDetail(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.ThemeToResponse(themeWithDetail))
+}
+
+func (h *themeHandlers) Delete(w http.ResponseWriter, r *http.Request) {
+	id, err := httputils.ParseUUID(r, "id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := h.themeService.Delete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "Тема удалена"})
+}
+
+func (h *themeHandlers) GetQuestions(w http.ResponseWriter, r *http.Request) {
+	themeID, err := httputils.ParseUUID(r, "theme_id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	questions, err := h.questionService.GetList(r.Context(), themeID)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string][]*domain.Question{"data": questions})
+}
+
+func (h *themeHandlers) CreateQuestion(w http.ResponseWriter, r *http.Request) {
+	themeID, err := httputils.ParseUUID(r, "theme_id")
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	questionCreateRequest, err := httputils.DecodeJSONBodyWithValidate[dto.QuestionCreateRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+	// Наша внутренняя валидация
+	if err := questionCreateRequest.Validate(); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	question := domain.Question{
+		ThemeID:      themeID,
+		QuestionType: dto.GetQuestionTypeFromStr(questionCreateRequest.Name),
+		Name:         questionCreateRequest.Name,
+		PointCorrect: questionCreateRequest.PointCorrect,
+	}
+
+	if err := h.questionService.Create(r.Context(), &question); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.QuestionToResponse(&question))
+}
+
+func (h *themeHandlers) UpdateQuestion(w http.ResponseWriter, r *http.Request) {
+	themeID, err := httputils.ParseUUID(r, "theme_id")
+	_ = themeID
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	id, err := httputils.ParseUUID(r, "id")
+
+	questionUpdateRequest, err := httputils.DecodeJSONBodyWithValidate[dto.QuestionUpdateRequest](r, h.validate)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+	// Наша внутренняя валидация
+	if err := questionUpdateRequest.Validate(); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	question, err := h.questionService.GetByID(r.Context(), id)
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	question.QuestionType = dto.GetQuestionTypeFromStr(questionUpdateRequest.Name)
+	question.Name = questionUpdateRequest.Name
+	question.PointCorrect = questionUpdateRequest.PointCorrect
+
+	if err := h.questionService.Update(r.Context(), question); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, dto.QuestionToResponse(question))
+}
+
+func (h *themeHandlers) DeleteQuestion(w http.ResponseWriter, r *http.Request) {
+	themeID, err := httputils.ParseUUID(r, "theme_id")
+	_ = themeID
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	id, err := httputils.ParseUUID(r, "id")
+
+	if err := h.questionService.Delete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "Вопрос удален"})
+}
+
+func (h *themeHandlers) ChangeSortQuestion(w http.ResponseWriter, r *http.Request) {
+	themeID, err := httputils.ParseUUID(r, "theme_id")
+	_ = themeID
+	if err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	id, err := httputils.ParseUUID(r, "id")
+
+	if err := h.questionService.Delete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	questionSetOrderRequest, err := httputils.DecodeJSONBodyWithValidate[dto.QuestionSetOrderRequest](r, h.validate)
+	if err := h.questionService.Delete(r.Context(), id); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	if err := h.questionService.SetSortOrder(r.Context(), id, questionSetOrderRequest.SortOrder); err != nil {
+		httputils.WriteError(w, err)
+		return
+	}
+
+	httputils.WriteOk(w, map[string]string{"message": "Изменение сортировки успешно"})
+}
+-e 
+
+=== FILE: ./internal/handler/upload_handler.go ===
+package handler
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/Voltage11/tplatform/internal/config"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/Voltage11/tplatform/pkg/logger"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+type UploadHandler struct {
+    cfg    config.UploadConfig
+    logger logger.Logger
+}
+
+func NewUploadHandler(r chi.Router, authMW *middleware.AuthMiddleware, cfg config.UploadConfig, log logger.Logger) {
+    h := &UploadHandler{cfg: cfg, logger: log}
+
+    // Защищаем маршрут – только авторизованные пользователи
+    r.Group(func(r chi.Router) {
+        r.Use(authMW.RequireAuth)
+        r.Post("/api/v1/upload", h.Upload)
+    })
+}
+
+func (h *UploadHandler) Upload(w http.ResponseWriter, r *http.Request) {
+    // Ограничиваем размер тела запроса
+    r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxSizeMB<<20) 
+
+    // Парсим форму
+    if err := r.ParseMultipartForm(10 << 20); err != nil {
+        httputils.WriteError(w, apperror.NewBadRequest("файл слишком большой или неверный формат", err))
+        return
+    }
+
+    file, header, err := r.FormFile("file")
+    if err != nil {
+        httputils.WriteError(w, apperror.NewBadRequest("не удалось получить файл", err))
+        return
+    }
+    defer file.Close()
+
+    // Проверяем тип файла
+    contentType := header.Header.Get("Content-Type")
+    allowedTypes := map[string]bool{
+        "image/jpeg":    true,
+        "image/png":     true,
+        "image/gif":     true,
+        "image/svg+xml": true,
+    }
+    if !allowedTypes[contentType] {
+        httputils.WriteError(w, apperror.NewBadRequest("недопустимый тип файла. Разрешены JPEG, PNG, GIF, SVG", nil))
+        return
+    }
+
+    // Проверяем расширение
+    ext := strings.ToLower(filepath.Ext(header.Filename))
+    if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".gif" && ext != ".svg" {
+        httputils.WriteError(w, apperror.NewBadRequest("недопустимое расширение файла", nil))
+        return
+    }
+
+    // Создаём директорию, если её нет
+    if err := os.MkdirAll(h.cfg.Dir, 0755); err != nil {
+        httputils.WriteError(w, apperror.NewInternal("ошибка создания директории", err))
+        return
+    }
+
+    // Генерируем уникальное имя файла
+    filename := fmt.Sprintf("%s%s", uuid.New().String(), ext)
+    destPath := filepath.Join(h.cfg.Dir, filename)
+
+    // Сохраняем файл
+    dst, err := os.Create(destPath)
+    if err != nil {
+        httputils.WriteError(w, apperror.NewInternal("не удалось создать файл", err))
+        return
+    }
+    defer dst.Close()
+
+    if _, err := io.Copy(dst, file); err != nil {
+        httputils.WriteError(w, apperror.NewInternal("ошибка сохранения файла", err))
+        return
+    }
+
+    // Формируем URL для доступа (относительный путь)
+    fileURL := fmt.Sprintf("/uploads/%s", filename)
+
+    h.logger.Info("Файл загружен", "file", fileURL)
+
+    // Возвращаем URL
+    httputils.WriteJSON(w, http.StatusCreated, map[string]string{"url": fileURL})
+}-e 
+
+=== FILE: ./internal/repository/permission.go ===
+package repository
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+)
+
+type permissionsRepository struct {
+	db *db.PostgresDB
+}
+
+func NewPermissionsRepository(db *db.PostgresDB) domain.PermissionsRepository {
+	return &permissionsRepository{db: db}
+}
+
+func (r *permissionsRepository) SetAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error {
+	query := `
+        INSERT INTO role_permissions (role_id, entity_name, action_name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+    `
+
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query, roleID, entityName, actionName)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	return nil
+}
+
+func (r *permissionsRepository) RemoveAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error {
+	query := `DELETE FROM role_permissions WHERE role_id = $1 AND entity_name = $2 AND action_name = $3`
+	
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, roleID, entityName, actionName)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Право не найдено", nil)
+	}
+	return nil
+}
+
+func (r *permissionsRepository) GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]domain.RolePermission, error) {
+	query := `SELECT role_id, entity_name, action_name FROM role_permissions WHERE role_id = $1`
+	
+	executor := r.db.GetDB(ctx)
+	rows, err := executor.Query(ctx, query, roleID)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+	defer rows.Close()
+
+	var perms []domain.RolePermission
+	for rows.Next() {
+		var p domain.RolePermission
+		if err := rows.Scan(&p.RoleID, &p.EntityName, &p.ActionName); err != nil {
+			return nil, apperror.NewPostgresError(err)
+		}
+		perms = append(perms, p)
+	}
+	return perms, rows.Err()
+}
+
+func (r *permissionsRepository) ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error {
+	query := `DELETE FROM role_permissions WHERE role_id = $1`
+	
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query, roleID)
+	return apperror.NewPostgresError(err)
+}
+-e 
+
+=== FILE: ./internal/repository/department.go ===
+package repository
+
+import (
+	"context"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+	"github.com/huandu/go-sqlbuilder"
+)
+
+type departmentRepository struct {
+	db *db.PostgresDB
+}
+
+func NewDepartmentRepository(db *db.PostgresDB) domain.DepartmentRepository {
+	return &departmentRepository{db: db}
+}
+
+func (d *departmentRepository) Create(ctx context.Context, department *domain.Department) error {
+	now := time.Now().UTC()
+	department.CreatedAt = now
+	department.UpdatedAt = now
+
+	query := `INSERT INTO departments (name, created_at, updated_at) VALUES ($1, $2, $3) RETURNING id`
+
+	executor := d.db.GetDB(ctx)
+	if err := executor.QueryRow(ctx, query, department.Name, department.CreatedAt, department.UpdatedAt).Scan(&department.ID); err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	return nil
+}
+
+func (d *departmentRepository) Update(ctx context.Context, department *domain.Department) error {
+	department.UpdatedAt = time.Now().UTC()
+
+	query := `UPDATE departments SET name = $1, updated_at = $2 WHERE id = $3`
+
+	executor := d.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, department.Name, department.UpdatedAt, department.ID)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Отдел не найден", nil)
+	}
+	return nil
+}
+
+func (d *departmentRepository) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	deletedAt := time.Now().UTC()
+	query := `UPDATE departments SET deleted_at = $1 WHERE id = $2 AND deleted_at IS NULL`
+
+	executor := d.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, deletedAt, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Отдел не найден", nil)
+	}
+	return nil
+}
+
+func (d *departmentRepository) HardDelete(ctx context.Context, id uuid.UUID) error {
+	query := `DELETE FROM departments WHERE id = $1`
+
+	executor := d.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Отдел не найден", nil)
+	}
+	return nil
+}
+
+// GetByID в слое сервиса нужно проверить кто запрашивает, если запись мягко удалена и не админ, то отказать
+func (d *departmentRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Department, error) {
+	query := `SELECT id, name, created_at, updated_at, deleted_at FROM departments WHERE id = $1`
+
+	department := &domain.Department{}
+	
+	executor := d.db.GetDB(ctx)
+	if err := executor.QueryRow(ctx, query, id).Scan(
+		&department.ID, &department.Name, &department.CreatedAt, &department.UpdatedAt, &department.DeletedAt,
+	); err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+	return department, nil
+}
+
+func (d *departmentRepository) GetList(ctx context.Context, filter domain.DepartmentFilter) ([]*domain.Department, int64, error) {
+	sbFilter := sqlbuilder.PostgreSQL.NewSelectBuilder()
+	sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
+
+	sbFilter.Select("id", "name", "created_at", "updated_at", "deleted_at").
+		From("departments").
+		Where(sbFilter.IsNull("deleted_at"))
+
+	sbCount.Select("COUNT(*)").From("departments").
+		Where(sbCount.IsNull("deleted_at"))
+
+	if filter.Name != "" {
+		pattern := "%" + filter.Name + "%"
+		sbFilter.Where(sbFilter.ILike("name", pattern))
+		sbCount.Where(sbCount.ILike("name", pattern))
+	}
+
+	sbFilter.Limit(filter.Pagination.GetLimit()).
+		Offset(filter.Pagination.GetOffset()).
+		OrderBy("name")
+
+	return getList(ctx, d.db, sbFilter, sbCount, func(scanner rowScanner) (*domain.Department, error) {
+		var dep domain.Department
+		err := scanner.Scan(&dep.ID, &dep.Name, &dep.CreatedAt, &dep.UpdatedAt, &dep.DeletedAt)
+		return &dep, err
+	})
+}
+-e 
+
+=== FILE: ./internal/repository/role.go ===
+package repository
+
+import (
+	"context"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+	"github.com/huandu/go-sqlbuilder"
+)
+
+type roleRepository struct {
+	db *db.PostgresDB
+}
+
+func NewRoleRepository(db *db.PostgresDB) domain.RoleRepository {
+	return &roleRepository{db: db}
+}
+
+func (r *roleRepository) Create(ctx context.Context, role *domain.Role) error {
+	role.CreatedAt = time.Now().UTC()
+
+	query := `INSERT INTO roles (name, description, created_at) VALUES ($1, $2, $3) RETURNING id`
+
+	executor := r.db.GetDB(ctx)
+	err := executor.QueryRow(ctx, query, role.Name, role.Description, role.CreatedAt).Scan(&role.ID)
+
+	return apperror.NewPostgresError(err)
+}
+
+func (r *roleRepository) Update(ctx context.Context, role *domain.Role) error {
+	query := `UPDATE roles SET name = $1, description = $2 WHERE id = $3`
+
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, role.Name, role.Description, role.ID)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("роль не найдена", nil)
+	}
+	return nil
+}
+
+func (r *roleRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Role, error) {
+	query := `SELECT id, name, description, created_at FROM roles WHERE id = $1`
+	role := &domain.Role{}
+	
+	executor := r.db.GetDB(ctx)
+	err := executor.QueryRow(ctx, query, id).Scan(&role.ID, &role.Name, &role.Description, &role.CreatedAt)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+	return role, nil
+}
+
+func (r *roleRepository) Delete(ctx context.Context, id uuid.UUID) error {
+	query := `DELETE FROM roles WHERE id = $1`
+
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("роль не найдена", nil)
+	}
+	return nil
+}
+
+func (r *roleRepository) GetList(ctx context.Context, filter domain.RoleFilter) ([]*domain.Role, int64, error) {
+	sbFilter := sqlbuilder.PostgreSQL.NewSelectBuilder()
+	sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
+
+	sbFilter.Select("id", "name", "description", "created_at").
+		From("roles")
+		// Where(sbFilter.IsNull("deleted_at"))
+
+	sbCount.Select("COUNT(*)").From("roles")
+		// Where(sbCount.IsNull("deleted_at"))
+
+	if filter.Name != "" {
+		pattern := "%" + filter.Name + "%"
+		sbFilter.Where(sbFilter.ILike("name", pattern))
+		sbCount.Where(sbCount.ILike("name", pattern))
+	}
+
+	sbFilter.Limit(filter.Pagination.GetLimit()).
+		Offset(filter.Pagination.GetOffset()).
+		OrderBy("name")
+
+	return getList(ctx, r.db, sbFilter, sbCount, func(scanner rowScanner) (*domain.Role, error) {
+		var role domain.Role
+		err := scanner.Scan(&role.ID, &role.Name, &role.Description, &role.CreatedAt)
+		return &role, err
+	})
+}
+-e 
+
+=== FILE: ./internal/repository/common.go ===
+package repository
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/huandu/go-sqlbuilder"
+)
+
+type rowScanner interface {
+    Scan(dest ...any) error
+}
+
+func getList[T any](
+	ctx context.Context,
+	postgresDB *db.PostgresDB,
+	sbFilter, sbCount *sqlbuilder.SelectBuilder,
+	scanRow func(scanner rowScanner) (T, error),
+) ([]T, int64, error) {
+	queryFilter, argsFilter := sbFilter.Build()
+	queryCount, argsCount := sbCount.Build()
+
+	// 2. Автоматически получаем нужный исполнитель (транзакция или пул)
+	executor := postgresDB.GetDB(ctx)
+
+	// 3. Выполняем подсчет общего количества
+	var total int64
+	if err := executor.QueryRow(ctx, queryCount, argsCount...).Scan(&total); err != nil {
+		return nil, 0, apperror.NewPostgresError(err)
+	}
+
+	if total == 0 {
+		return []T{}, 0, nil
+	}
+
+	// 4. Выполняем фильтрованный запрос списка
+	rows, err := executor.Query(ctx, queryFilter, argsFilter...)
+	if err != nil {
+		return nil, 0, apperror.NewPostgresError(err)
+	}
+	defer rows.Close()
+
+	result := make([]T, 0, total)
+	for rows.Next() {
+		item, err := scanRow(rows)
+		if err != nil {
+			return nil, 0, apperror.NewPostgresError(err)
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, apperror.NewPostgresError(err)
+	}
+	return result, total, nil
+}-e 
+
+=== FILE: ./internal/repository/user.go ===
+package repository
+
+import (
+	"context"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/Voltage11/tplatform/pkg/helpers"
+	"github.com/google/uuid"
+	"github.com/huandu/go-sqlbuilder"
+)
+
+type userRepository struct {
+	db *db.PostgresDB
+}
+
+func NewUserRepository(postgresDB *db.PostgresDB) domain.UserRepository {
+	return &userRepository{db: postgresDB}
+}
+
+func (u *userRepository) Create(ctx context.Context, user *domain.User) error {
+	now := time.Now().UTC()
+	user.CreatedAt = now
+	user.UpdatedAt = now
+
+	query := `INSERT INTO users 
+        (first_name, second_name, last_name, email, password_hash, department_id, role_id, is_active, is_admin, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING id`
+
+	executor := u.db.GetDB(ctx)
+
+	if err := executor.QueryRow(ctx, query,
+		user.FirstName,
+		user.SecondName,
+		user.LastName,
+		user.Email,
+		user.PasswordHash,
+		user.DepartmentID,
+		user.RoleID,
+		user.IsActive,
+		user.IsAdmin,
+		user.CreatedAt,
+		user.UpdatedAt,
+	).Scan(&user.ID); err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	return nil
+}
+
+// Update обновляем любые поля, кроме password_hash
+func (u *userRepository) Update(ctx context.Context, user *domain.User) error {
+	user.UpdatedAt = time.Now().UTC()
+
+	query := `UPDATE users SET 
+        first_name = $1, second_name = $2, last_name = $3, email = $4, 
+        department_id = $5, role_id = $6, is_active = $7, is_admin = $8, updated_at = $9
+        WHERE id = $10`
+
+	executor := u.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query,
+		user.FirstName, user.SecondName, user.LastName, user.Email,
+		user.DepartmentID,
+		user.RoleID,
+		user.IsActive,
+		user.IsAdmin,
+		user.UpdatedAt,
+		user.ID,
+	)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Пользователь не найден", nil)
+	}
+	return nil
+}
+
+func (u *userRepository) SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error {
+	query := `UPDATE users SET is_active = $1 WHERE id = $2 AND deleted_at IS NULL`
+	
+	executor := u.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query, isActive, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Пользователь не найден", nil)
+	}
+	return nil
+}
+
+func (u *userRepository) HardDelete(ctx context.Context, id uuid.UUID) error {
+	query := `DELETE FROM users WHERE id = $1`
+	
+	executor := u.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Пользователь не найден", nil)
+	}
+	return nil
+}
+
+func (u *userRepository) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	deletedAt := time.Now().UTC()
+	query := `UPDATE users SET deleted_at = $1 WHERE id = $2 AND deleted_at IS NULL`
+	
+	executor := u.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, deletedAt, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Пользователь не найден", nil)
+	}
+	return nil
+}
+
+func (u *userRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
+	query := `SELECT id, first_name, second_name, last_name, email, password_hash, 
+        department_id, role_id, is_active, is_admin, created_at, updated_at, deleted_at
+        FROM users WHERE id = $1 AND deleted_at IS NULL`
+
+	user := &domain.User{}
+	var deptID, roleID uuid.NullUUID
+
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, id).Scan(
+		&user.ID,
+		&user.FirstName,
+		&user.SecondName,
+		&user.LastName,
+		&user.Email,
+		&user.PasswordHash,
+		&deptID,
+		&roleID,
+		&user.IsActive,
+		&user.IsAdmin, // <-- обязательно
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+	)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+	user.DepartmentID = helpers.ScanNullableUUID(deptID)
+	user.RoleID = helpers.ScanNullableUUID(roleID)
+	return user, nil
+}
+
+func (u *userRepository) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.UserWithDetail, error) {
+	query := `SELECT 
+        u.id, u.first_name, u.second_name, u.last_name, u.email, u.password_hash,
+        u.department_id, u.role_id, u.is_active, u.is_admin, 
+        u.created_at, u.updated_at, u.deleted_at,
+        d.id AS dept_id, d.name AS dept_name,
+        r.id AS role_id_val, r.name AS role_name
+    FROM users u
+    LEFT JOIN departments d ON u.department_id = d.id
+    LEFT JOIN roles r ON u.role_id = r.id
+    WHERE u.id = $1 AND u.deleted_at IS NULL`
+
+	user := &domain.UserWithDetail{}
+	var deptID, roleID uuid.NullUUID
+	var deptIDPtr, roleIDPtr *uuid.UUID
+	var deptName, roleName *string
+
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, id).Scan(
+		&user.ID,
+		&user.FirstName,
+		&user.SecondName,
+		&user.LastName,
+		&user.Email,
+		&user.PasswordHash,
+		&deptID,
+		&roleID,
+		&user.IsActive,
+		&user.IsAdmin,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+		&deptIDPtr,
+		&deptName,
+		&roleIDPtr,
+		&roleName,
+	)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+
+	user.DepartmentID = helpers.ScanNullableUUID(deptID)
+	user.RoleID = helpers.ScanNullableUUID(roleID)
+
+	if deptIDPtr != nil && deptName != nil {
+		user.Department = &domain.DepartmentDetail{
+			ID:   *deptIDPtr,
+			Name: *deptName,
+		}
+	}
+	if roleIDPtr != nil && roleName != nil {
+		user.Role = &domain.RoleDetail{
+			ID:   *roleIDPtr,
+			Name: *roleName,
+		}
+	}
+
+	return user, nil
+}
+
+func (u *userRepository) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
+	query := `SELECT id, first_name, second_name, last_name, email, password_hash, 
+        department_id, role_id, is_active, is_admin, created_at, updated_at, deleted_at
+        FROM users WHERE email = $1 AND deleted_at IS NULL`
+
+	user := &domain.User{}
+	var deptID, roleID uuid.NullUUID
+
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, email).Scan(
+		&user.ID, &user.FirstName, &user.SecondName, &user.LastName, &user.Email,
+		&user.PasswordHash, &deptID, &roleID, &user.IsActive, &user.IsAdmin,
+		&user.CreatedAt, &user.UpdatedAt, &user.DeletedAt,
+	)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+	user.DepartmentID = helpers.ScanNullableUUID(deptID)
+	user.RoleID = helpers.ScanNullableUUID(roleID)
+	return user, nil
+}
+
+func (u *userRepository) GetByEmailWithDetail(ctx context.Context, email string) (*domain.UserWithDetail, error) {
+	query := `SELECT 
+        u.id, u.first_name, u.second_name, u.last_name, u.email, u.password_hash,
+        u.department_id, u.role_id, u.is_active, u.is_admin, 
+        u.created_at, u.updated_at, u.deleted_at,
+        d.id AS dept_id, d.name AS dept_name,
+        r.id AS role_id_val, r.name AS role_name
+    FROM users u
+    LEFT JOIN departments d ON u.department_id = d.id
+    LEFT JOIN roles r ON u.role_id = r.id
+    WHERE u.email = $1 AND u.deleted_at IS NULL`
+
+	user := &domain.UserWithDetail{}
+	var deptID, roleID uuid.NullUUID
+	var deptIDPtr, roleIDPtr *uuid.UUID
+	var deptName, roleName *string
+
+	executor := u.db.GetDB(ctx)
+
+	err := executor.QueryRow(ctx, query, email).Scan(
+		&user.ID,
+		&user.FirstName,
+		&user.SecondName,
+		&user.LastName,
+		&user.Email,
+		&user.PasswordHash,
+		&deptID,
+		&roleID,
+		&user.IsActive,
+		&user.IsAdmin,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+		&user.DeletedAt,
+		&deptIDPtr,
+		&deptName,
+		&roleIDPtr,
+		&roleName,
+	)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+
+	user.DepartmentID = helpers.ScanNullableUUID(deptID)
+	user.RoleID = helpers.ScanNullableUUID(roleID)
+
+	if deptIDPtr != nil && deptName != nil {
+		user.Department = &domain.DepartmentDetail{
+			ID:   *deptIDPtr,
+			Name: *deptName,
+		}
+	}
+	if roleIDPtr != nil && roleName != nil {
+		user.Role = &domain.RoleDetail{
+			ID:   *roleIDPtr,
+			Name: *roleName,
+		}
+	}
+
+	return user, nil
+}
+
+func (u *userRepository) GetList(ctx context.Context, filter domain.UserFilter) ([]*domain.UserWithDetail, int64, error) {
+	sbFilter := sqlbuilder.PostgreSQL.NewSelectBuilder()
+	sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
+
+	// Основной фильтр с LEFT JOIN
+	sbFilter.Select(
+		"u.id", "u.first_name", "u.second_name", "u.last_name",
+		"u.email", "u.password_hash",
+		"u.department_id", "u.role_id", "u.is_active", "u.is_admin",
+		"u.created_at", "u.updated_at", "u.deleted_at",
+		"d.id AS dept_id", "d.name AS dept_name",
+		"r.id AS role_id_val", "r.name AS role_name",
+	).
+		From("users u").
+		JoinWithOption(sqlbuilder.LeftJoin, "departments d", "u.department_id = d.id").
+		JoinWithOption(sqlbuilder.LeftJoin, "roles r", "u.role_id = r.id").
+		Where(sbFilter.IsNull("u.deleted_at"))
+
+	sbCount.Select("COUNT(*)").From("users u").
+		Where(sbCount.IsNull("u.deleted_at"))
+
+	// Фильтры
+	if filter.FirstName != "" {
+		pattern := "%" + filter.FirstName + "%"
+		sbFilter.Where(sbFilter.ILike("u.first_name", pattern))
+		sbCount.Where(sbCount.ILike("u.first_name", pattern))
+	}
+	if filter.SecondName != "" {
+		pattern := "%" + filter.SecondName + "%"
+		sbFilter.Where(sbFilter.ILike("u.second_name", pattern))
+		sbCount.Where(sbCount.ILike("u.second_name", pattern))
+	}
+	if filter.LastName != "" {
+		pattern := "%" + filter.LastName + "%"
+		sbFilter.Where(sbFilter.ILike("u.last_name", pattern))
+		sbCount.Where(sbCount.ILike("u.last_name", pattern))
+	}
+	if filter.Email != "" {
+		pattern := "%" + filter.Email + "%"
+		sbFilter.Where(sbFilter.ILike("u.email", pattern))
+		sbCount.Where(sbCount.ILike("u.email", pattern))
+	}
+	if filter.DepartmentID != nil {
+		sbFilter.Where(sbFilter.Equal("u.department_id", *filter.DepartmentID))
+		sbCount.Where(sbCount.Equal("u.department_id", *filter.DepartmentID))
+	}
+	if filter.RoleID != nil {
+		sbFilter.Where(sbFilter.Equal("u.role_id", *filter.RoleID))
+		sbCount.Where(sbCount.Equal("u.role_id", *filter.RoleID))
+	}
+	if isActive := filter.IsActive.GetBool(); isActive != nil {
+		sbFilter.Where(sbFilter.Equal("u.is_active", *isActive))
+		sbCount.Where(sbCount.Equal("u.is_active", *isActive))
+	}
+
+	sbFilter.Limit(filter.Pagination.GetLimit()).
+		Offset(filter.Pagination.GetOffset()).
+		OrderBy("u.last_name")
+
+	// Используем универсальный getList с готовой scanUserRow
+	return getList(ctx, u.db, sbFilter, sbCount, scanUserRow)
+}
+
+func scanUserRow(scanner rowScanner) (*domain.UserWithDetail, error) {
+	usr := &domain.UserWithDetail{}
+	var deptID, roleID uuid.NullUUID
+	var deptIDPtr, roleIDPtr *uuid.UUID
+	var deptName, roleName *string
+
+	err := scanner.Scan(
+		&usr.ID,
+		&usr.FirstName,
+		&usr.SecondName,
+		&usr.LastName,
+		&usr.Email,
+		&usr.PasswordHash,
+		&deptID,
+		&roleID,
+		&usr.IsActive,
+		&usr.IsAdmin,
+		&usr.CreatedAt,
+		&usr.UpdatedAt,
+		&usr.DeletedAt,
+		&deptIDPtr,
+		&deptName,
+		&roleIDPtr,
+		&roleName,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	usr.DepartmentID = helpers.ScanNullableUUID(deptID)
+	usr.RoleID = helpers.ScanNullableUUID(roleID)
+
+	if deptIDPtr != nil && deptName != nil {
+		usr.Department = &domain.DepartmentDetail{ID: *deptIDPtr, Name: *deptName}
+	}
+	if roleIDPtr != nil && roleName != nil {
+		usr.Role = &domain.RoleDetail{ID: *roleIDPtr, Name: *roleName}
+	}
+	return usr, nil
+}
+-e 
+
+=== FILE: ./internal/repository/helpers.go ===
+package repository
+
+import (
+    "context"
+
+    "github.com/jackc/pgx/v5"
+    "github.com/jackc/pgx/v5/pgconn"
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Executor — интерфейс для выполнения запросов
+// Ему удовлетворяют *pgxpool.Pool и pgx.Tx.
+type Executor interface {
+    Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+    Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// GetExecutor возвращает переданную транзакцию, если она не nil, иначе возвращает пул соединений.
+func GetExecutor(pool *pgxpool.Pool, tx pgx.Tx) Executor {
+    if tx != nil {
+        return tx
+    }
+    return pool
+}-e 
+
+=== FILE: ./internal/repository/session.go ===
+package repository
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+)
+
+type sessionRepository struct {
+	db *db.PostgresDB
+}
+
+func NewSessionRepository(db *db.PostgresDB) domain.SessionRepository {
+	return &sessionRepository{db: db}
+}
+
+func (r *sessionRepository) Create(ctx context.Context, session *domain.Session) error {
+	query := `
+        INSERT INTO sessions (id, user_id, refresh_token_hash, expires_at, created_at, user_agent, client_ip)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `
+
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query,
+		session.ID,
+		session.UserID,
+		session.RefreshTokenHash,
+		session.ExpiresAt,
+		session.CreatedAt,
+		session.UserAgent,
+		session.ClientIP,
+	)
+	return apperror.NewPostgresError(err)
+}
+
+func (r *sessionRepository) GetByRefreshTokenHash(ctx context.Context, hash string) (*domain.Session, error) {
+	query := `
+        SELECT id, user_id, refresh_token_hash, expires_at, created_at, revoked_at, user_agent, client_ip
+        FROM sessions
+        WHERE refresh_token_hash = $1
+    `
+	var s domain.Session
+
+	executor := r.db.GetDB(ctx)
+	err := executor.QueryRow(ctx, query, hash).Scan(
+		&s.ID, &s.UserID, &s.RefreshTokenHash, &s.ExpiresAt, &s.CreatedAt, &s.RevokedAt,
+		&s.UserAgent, &s.ClientIP,
+	)
+	if err != nil {
+		return nil, apperror.NewPostgresError(err)
+	}
+	return &s, nil
+}
+
+func (r *sessionRepository) Revoke(ctx context.Context, id uuid.UUID) error {
+	query := `UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL`
+
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("сессия не найдена или уже отозвана", nil)
+	}
+	return nil
+}
+
+func (r *sessionRepository) RevokeAllUserSessions(ctx context.Context, userID uuid.UUID) error {
+	query := `UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`
+
+	executor := r.db.GetDB(ctx)
+	_, err := executor.Exec(ctx, query, userID)
+	return apperror.NewPostgresError(err)
+}
+
+func (r *sessionRepository) DeleteExpired(ctx context.Context) (int64, error) {
+	query := `DELETE FROM sessions WHERE expires_at < NOW()`
+
+	executor := r.db.GetDB(ctx)
+	result, err := executor.Exec(ctx, query)
+	if err != nil {
+		return 0, apperror.NewPostgresError(err)
+	}
+	return result.RowsAffected(), nil
+}
+-e 
+
+=== FILE: ./internal/repository/theme.go ===
+package repository
+
+import (
+    "context"
+    "time"
+
+    "github.com/Voltage11/tplatform/internal/db"
+    "github.com/Voltage11/tplatform/internal/domain"
+    "github.com/Voltage11/tplatform/internal/types/apperror"
+    "github.com/google/uuid"
+    "github.com/huandu/go-sqlbuilder"
+)
+
+type themeRepository struct {
+    db *db.PostgresDB
+}
+
+func NewThemeRepository(db *db.PostgresDB) domain.ThemeRepository {
+    return &themeRepository{db: db}
+}
+
+func (t *themeRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Theme, error) {
+    query := `SELECT id, name, description, is_active, created_by_id, created_at,
+        date_begin, date_end, max_point, check_point, img_path
+        FROM themes WHERE id = $1`
+
+    var theme domain.Theme
+    exec := t.db.GetDB(ctx)
+    err := exec.QueryRow(ctx, query, id).Scan(
+        &theme.ID, &theme.Name, &theme.Description, &theme.IsActive,
+        &theme.CreatedByID, &theme.CreatedAt, &theme.DateBegin, &theme.DateEnd,
+        &theme.MaxPoint, &theme.CheckPoint, &theme.ImgPath,
+    )
+    if err != nil {
+        return nil, apperror.NewPostgresError(err)
+    }
+    return &theme, nil
+}
+
+func (t *themeRepository) GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*domain.ThemeWithDetail, error) {
+    query := `SELECT t.id, t.name, t.description, t.is_active, t.created_by_id, t.created_at,
+        t.date_begin, t.date_end, t.max_point, t.check_point, t.img_path,
+        u.id AS user_id, CONCAT_WS(' ', u.first_name, u.last_name) AS user_name
+        FROM themes t JOIN users u ON t.created_by_id = u.id
+        WHERE t.id = $1`
+
+    var theme domain.ThemeWithDetail
+    exec := t.db.GetDB(ctx)
+    err := exec.QueryRow(ctx, query, id).Scan(
+        &theme.ID, &theme.Name, &theme.Description, &theme.IsActive,
+        &theme.CreatedByID, &theme.CreatedAt, &theme.DateBegin, &theme.DateEnd,
+        &theme.MaxPoint, &theme.CheckPoint, &theme.ImgPath,
+        &theme.CreatedBy.ID, &theme.CreatedBy.Name,
+    )
+    if err != nil {
+        return nil, apperror.NewPostgresError(err)
+    }
+    return &theme, nil
+}
+
+func (t *themeRepository) Create(ctx context.Context, theme *domain.Theme) error {
+    query := `INSERT INTO themes(name, description, is_active, created_by_id, created_at,
+        date_begin, date_end, check_point, img_path)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id`
+
+    theme.CreatedAt = time.Now().UTC()
+
+    exec := t.db.GetDB(ctx)
+    err := exec.QueryRow(ctx, query,
+        theme.Name, theme.Description, theme.IsActive, theme.CreatedByID,
+        theme.CreatedAt, theme.DateBegin, theme.DateEnd, theme.CheckPoint, theme.ImgPath,
+    ).Scan(&theme.ID)
+    return apperror.NewPostgresError(err)
+}
+
+func (t *themeRepository) Update(ctx context.Context, theme *domain.Theme) error {
+    query := `UPDATE themes SET name = $1, description = $2, is_active = $3,
+        date_begin = $4, date_end = $5, check_point = $6, img_path = $7
+        WHERE id = $8`
+
+    exec := t.db.GetDB(ctx)
+    result, err := exec.Exec(ctx, query,
+        theme.Name, theme.Description, theme.IsActive,
+        theme.DateBegin, theme.DateEnd, theme.CheckPoint, theme.ImgPath, theme.ID,
+    )
+    if err != nil {
+        return apperror.NewPostgresError(err)
+    }
+    if result.RowsAffected() == 0 {
+        return apperror.NewNotFound("Тема не найдена", nil)
+    }
+    return nil
+}
+
+func (t *themeRepository) Delete(ctx context.Context, id uuid.UUID) error {
+    query := `DELETE FROM themes WHERE id = $1`
+    exec := t.db.GetDB(ctx)
+    result, err := exec.Exec(ctx, query, id)
+    if err != nil {
+        return apperror.NewPostgresError(err)
+    }
+    if result.RowsAffected() == 0 {
+        return apperror.NewNotFound("Тема не найдена", nil)
+    }
+    return nil
+}
+
+func (t *themeRepository) SetActive(ctx context.Context, id uuid.UUID, isActive bool) error {
+    query := `UPDATE themes SET is_active = $1 WHERE id = $2`
+    exec := t.db.GetDB(ctx)
+    result, err := exec.Exec(ctx, query, isActive, id)
+    if err != nil {
+        return apperror.NewPostgresError(err)
+    }
+    if result.RowsAffected() == 0 {
+        return apperror.NewNotFound("Тема не найдена", nil)
+    }
+    return nil
+}
+
+func (t *themeRepository) GetList(ctx context.Context, filter domain.ThemeFilter) ([]*domain.ThemeWithDetail, int64, error) {
+    sbFilter := sqlbuilder.PostgreSQL.NewSelectBuilder()
+    sbCount := sqlbuilder.PostgreSQL.NewSelectBuilder()
+
+    sbFilter.Select(
+        "t.id", "t.name", "t.description", "t.is_active", "t.created_by_id",
+        "t.created_at", "t.date_begin", "t.date_end", "t.max_point",
+        "t.check_point", "t.img_path",
+        "u.id AS user_id", "CONCAT_WS(' ', u.first_name, u.last_name) AS user_name",
+    ).
+        From("themes t").
+        JoinWithOption(sqlbuilder.LeftJoin, "users u", "t.created_by_id = u.id").
+        Where(sbFilter.IsNull("t.deleted_at"))
+
+    sbCount.Select("COUNT(*)").From("themes t").
+        Where(sbCount.IsNull("t.deleted_at"))
+
+    if filter.Name != "" {
+        pattern := "%" + filter.Name + "%"
+        sbFilter.Where(sbFilter.ILike("t.name", pattern))
+        sbCount.Where(sbCount.ILike("t.name", pattern))
+    }
+    if filter.CreatedByID != nil {
+        sbFilter.Where(sbFilter.Equal("t.created_by_id", *filter.CreatedByID))
+        sbCount.Where(sbCount.Equal("t.created_by_id", *filter.CreatedByID))
+    }
+    if isActive := filter.IsActive.GetBool(); isActive != nil {
+        sbFilter.Where(sbFilter.Equal("t.is_active", *isActive))
+        sbCount.Where(sbCount.Equal("t.is_active", *isActive))
+    }
+    if filter.CreatedAtFrom != nil {
+        sbFilter.Where(sbFilter.GTE("t.created_at", filter.CreatedAtFrom))
+        sbCount.Where(sbCount.GTE("t.created_at", filter.CreatedAtFrom))
+    }
+    if filter.CreatedAtTo != nil {
+        sbFilter.Where(sbFilter.LTE("t.created_at", filter.CreatedAtTo))
+        sbCount.Where(sbCount.LTE("t.created_at", filter.CreatedAtTo))
+    }
+
+    sbFilter.Limit(filter.Pagination.GetLimit()).
+        Offset(filter.Pagination.GetOffset()).
+        OrderBy("t.created_at")
+
+    return getList(ctx, t.db, sbFilter, sbCount, func(scanner rowScanner) (*domain.ThemeWithDetail, error) {
+        var theme domain.ThemeWithDetail
+        err := scanner.Scan(
+            &theme.ID, &theme.Name, &theme.Description, &theme.IsActive,
+            &theme.CreatedByID, &theme.CreatedAt, &theme.DateBegin, &theme.DateEnd,
+            &theme.MaxPoint, &theme.CheckPoint, &theme.ImgPath,
+            &theme.CreatedBy.ID, &theme.CreatedBy.Name,
+        )
+        if err != nil {
+            return nil, apperror.NewPostgresError(err)
+        }
+        return &theme, nil
+    })
+}-e 
+
+=== FILE: ./internal/repository/question.go ===
+package repository
+
+import (
+	"context"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/types/apperror"
+	"github.com/google/uuid"
+)
+
+type questionRepository struct {
+	db *db.PostgresDB
+}
+
+func NewQuestionRepository(db *db.PostgresDB) domain.QuestionRepository {
+	return &questionRepository{
+		db: db,
+	}
+}
+
+func (q *questionRepository)GetByID(ctx context.Context, id uuid.UUID) (*domain.Question, error) {
+	query := `
+		SELECT id, theme_id, question_type, name, point_correct, sort_order, created_at, updated_at
+		FROM questions
+		where id  =$1
+	`
+	var question domain.Question
+
+	executor := q.db.GetDB(ctx)
+
+	if err := executor.QueryRow(ctx, query, id).Scan(
+		&question.ID,
+		&question.ThemeID,
+		&question.QuestionType,
+		&question.Name,
+		&question.PointCorrect,
+		&question.SortOrder,
+		&question.CreatedAt,
+		&question.UpdatedAt); err != nil {
+			return nil, apperror.NewPostgresError(err)
+		}
+
+	return &question, nil
+}
+
+func (q *questionRepository) Create(ctx context.Context, question *domain.Question) error {
+	query := `
+		INSERT INTO questions(theme_id, question_type, name, point_correct, sort_order, created_at, updated_at)
+        VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING id
+	`
+	now := time.Now().UTC()
+	question.CreatedAt = now
+	question.UpdatedAt = now
+
+	executor := q.db.GetDB(ctx)
+
+	if err := executor.QueryRow(ctx, query,
+		question.ThemeID,
+		question.QuestionType,
+		question.Name,
+		question.PointCorrect,
+		question.SortOrder,
+		question.CreatedAt,
+		question.UpdatedAt).Scan(&question.ID); err != nil {
+		return apperror.NewPostgresError(err)
+	}
+
+	return nil
+}
+
+func (q *questionRepository) Update(ctx context.Context, question *domain.Question) error {
+	query := `
+		UPDATE questions 
+			SET question_type = $1, 
+				name = $2,
+				point_correct = $3,				
+				updated_at = $4
+		WHERE id = $5
+	`
+	question.UpdatedAt = time.Now().UTC()
+
+	executor := q.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query,
+		question.QuestionType,
+		question.Name,
+		question.PointCorrect,
+		// question.SortOrder,
+		question.UpdatedAt,
+		question.ID)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Вопрос не найден", nil)
+	}
+
+	return nil
+}
+
+// GetLastPositionInTheme Сколько уже вопросов в теме, для получения след. номера сортировки
+func (q *questionRepository) GetLastPositionInTheme(ctx context.Context, themeID uuid.UUID) (int, error) {
+	query := `
+		SELECT COUNT(*) as questions_count
+		FROM questions
+		WHERE theme_id = $1
+	`
+	executor := q.db.GetDB(ctx)
+
+	var out int
+
+	if err := executor.QueryRow(ctx, query, themeID).Scan(&out); err != nil {
+		return 0, apperror.NewPostgresError(err)
+	}
+
+	return out, nil
+}
+
+func (q *questionRepository) Delete(ctx context.Context, id uuid.UUID) error {
+	query := `DELETE FROM questions WHERE id = $1`
+
+	executor := q.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query, id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Вопрос не найден", nil)
+	}
+
+	return nil
+}
+
+func (q *questionRepository) GetList(ctx context.Context, themeID uuid.UUID) ([]*domain.Question, error) {
+	query := `
+		SELECT id, theme_id, question_type, name, point_correct, sort_order, created_at, updated_at
+		FROM questions
+		WHERE theme_id  =$1
+		ORDER BY sort_order
+	`
+	var questions []*domain.Question
+
+	executor := q.db.GetDB(ctx)
+
+	result, err := executor.Query(ctx, query, themeID)	
+	if err != nil {
+		return questions, apperror.NewPostgresError(err)
+	}
+
+	defer result.Close()
+
+	for result.Next() {
+		var question domain.Question
+
+		if err := result.Scan(
+			&question.ID,
+			&question.ThemeID,
+			&question.QuestionType,
+			&question.Name,
+			&question.PointCorrect,
+			&question.SortOrder,
+			&question.CreatedAt,
+			&question.UpdatedAt); err != nil {
+				return questions, apperror.NewPostgresError(err)
+			}
+
+		questions = append(questions, &question)
+	}
+
+	return questions, nil
+}
+
+func (q *questionRepository) SetSortOrder(ctx context.Context, id uuid.UUID, sortOrder int) error {
+	query := `
+		UPDATE questions 
+			SET sort_order = $1,
+				updated_at = $2
+		WHERE id = $3
+	`
+	
+	executor := q.db.GetDB(ctx)
+
+	result, err := executor.Exec(ctx, query, sortOrder, time.Now().UTC(), id)
+	if err != nil {
+		return apperror.NewPostgresError(err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return apperror.NewNotFound("Вопрос не найден", nil)
+	}
+
+	return nil
+}-e 
+
+=== FILE: ./internal/domain/tx.go ===
+package domain
+
+import "context"
+
+// Transactor управляет границами бизнес-транзакций
+// Сервисы не будут зависеть от драйвера субд
+type Transactor interface {
+	// WithinTransaction оборачивает выполнение функции fn в транзакцию.
+	// Если fn возвращает ошибку, транзакция откатывается. Если nil — коммитится
+	WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+}
+-e 
+
+=== FILE: ./internal/domain/permission.go ===
+package domain
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+)
+
+// PermissionAction — действие
+type PermissionAction struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	IsActive    bool   `json:"is_active"`
+}
+
+func (a PermissionAction) WithActive(isActive bool) PermissionAction {
+	return PermissionAction{
+		Name:        a.Name,
+		Description: a.Description,
+		IsActive:    isActive,
+	}
+}
+
+var (
+	ActionView       = PermissionAction{Name: "view", Description: "Просмотр"}
+	ActionCreate     = PermissionAction{Name: "create", Description: "Создание"}
+	ActionUpdate     = PermissionAction{Name: "update", Description: "Обновление"}
+	ActionSoftDelete = PermissionAction{Name: "soft_delete", Description: "Пометка на удаление"}
+	ActionHardDelete = PermissionAction{Name: "hard_delete", Description: "Удаление"}
+)
+
+type PermissionEntity struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+var (
+	EntityDepartments = PermissionEntity{Name: "departments", Description: "Отделы"}
+	EntityUsers       = PermissionEntity{Name: "users", Description: "Пользователи"}
+	EntityRoles       = PermissionEntity{Name: "roles", Description: "Роли"}
+	EntityThemes      = PermissionEntity{Name: "themes", Description: "Темы"}
+)
+
+type PermissionEntityWithActions struct {
+	Entity  PermissionEntity   `json:"entity"`
+	Actions []PermissionAction `json:"actions"`
+}
+
+func GetPermissionsEntitiesWithActions() []PermissionEntityWithActions {
+	return []PermissionEntityWithActions{
+		{
+			Entity:  EntityDepartments,
+			Actions: []PermissionAction{ActionView, ActionCreate, ActionUpdate, ActionSoftDelete},
+		},
+		{
+			Entity:  EntityUsers,
+			Actions: []PermissionAction{ActionView, ActionCreate, ActionUpdate, ActionSoftDelete, ActionHardDelete},
+		},
+		{
+			Entity:  EntityRoles,
+			Actions: []PermissionAction{ActionView, ActionCreate, ActionUpdate, ActionHardDelete},
+		},
+	}
+}
+
+// RolePermission — связка роли и конкретного права (БД)
+type RolePermission struct {
+	RoleID     uuid.UUID
+	EntityName string
+	ActionName string
+}
+
+// PermissionTarget — доменная структура для указания желаемых прав
+type PermissionTarget struct {
+	EntityName string
+	ActionName string
+}
+
+// PermissionsRepository работа с таблицей role_permissions
+type PermissionsRepository interface {
+	SetAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error
+	RemoveAction(ctx context.Context, roleID uuid.UUID, entityName, actionName string) error
+	GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]RolePermission, error)
+	ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error
+}
+
+// PermissionService сервис управления правами ролей
+type PermissionService interface {
+	SetAction(ctx context.Context, roleID uuid.UUID, entity PermissionEntity, actionName string) error
+	RemoveAction(ctx context.Context, roleID uuid.UUID, entity PermissionEntity, actionName string) error
+	GetForRole(ctx context.Context, roleID uuid.UUID) ([]PermissionEntityWithActions, error)
+	Can(ctx context.Context, user *User, entityName, actionName string) bool
+	CanFromCtx(ctx context.Context, entityName, actionName string) bool
+	ReplacePermissions(ctx context.Context, roleID uuid.UUID, targets []PermissionTarget) error
+	Shutdown()
+}
+-e 
+
+=== FILE: ./internal/domain/department.go ===
+package domain
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Department отдел
+type Department struct {
+	ID        uuid.UUID
+	Name      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt *time.Time
+}
+
+// DepartmentDetail сокр. отдел для связей с внешними таблицами
+type DepartmentDetail struct {
+	ID   uuid.UUID
+	Name string
+}
+
+// DepartmentFilter Входящий параметры с отбором и пагинацией
+type DepartmentFilter struct {
+	Name       string
+	Pagination PaginationRequest
+}
+
+// DepartmentRepository интерфейс для работы с репозиторием
+type DepartmentRepository interface {
+	Create(ctx context.Context, department *Department) error
+	Update(ctx context.Context, department *Department) error
+	SoftDelete(ctx context.Context, id uuid.UUID) error
+	HardDelete(ctx context.Context, id uuid.UUID) error
+	GetByID(ctx context.Context, id uuid.UUID) (*Department, error)
+	GetList(ctx context.Context, filter DepartmentFilter) ([]*Department, int64, error)
+}
+
+// DepartmentService интерфейс для работы с сервисом
+type DepartmentService interface {
+	Create(ctx context.Context, department *Department) error
+	Update(ctx context.Context, department *Department) error
+	SoftDelete(ctx context.Context, id uuid.UUID) error
+	HardDelete(ctx context.Context, id uuid.UUID) error
+	GetByID(ctx context.Context, id uuid.UUID) (*Department, error)
+	GetList(ctx context.Context, filter DepartmentFilter) (*PagedResult[*Department], error)
+}
+-e 
+
+=== FILE: ./internal/domain/role.go ===
+package domain
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ********************* РОЛЬ *********************
+
+// Role — роль пользователя
+type Role struct {
+	ID          uuid.UUID
+	Name        string
+	Description string
+	CreatedAt   time.Time
+}
+
+type RoleDetail struct {
+	ID   uuid.UUID
+	Name string
+}
+
+type RoleFilter struct {
+	Name       string
+	Pagination PaginationRequest
+}
+
+type RoleRepository interface {
+	Create(ctx context.Context, role *Role) error
+	Update(ctx context.Context, role *Role) error
+	GetByID(ctx context.Context, id uuid.UUID) (*Role, error)
+	GetList(ctx context.Context, filter RoleFilter) ([]*Role, int64, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+
+type RoleService interface {
+	Create(ctx context.Context, role *Role) error
+	Update(ctx context.Context, role *Role) error
+	GetByID(ctx context.Context, id uuid.UUID) (*Role, error)
+	GetList(ctx context.Context, filter RoleFilter) (*PagedResult[*Role], error)
+	Delete(ctx context.Context, id uuid.UUID) error
+}
+-e 
+
+=== FILE: ./internal/domain/user.go ===
+package domain
+
+import (
+	"context"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/config"
+	"github.com/Voltage11/tplatform/internal/types/filterbool"
+	"github.com/google/uuid"
+)
+
+type User struct {
+	ID           uuid.UUID
+	FirstName    string
+	SecondName   string
+	LastName     string
+	Email        string
+	PasswordHash string
+	DepartmentID *uuid.UUID
+	RoleID       *uuid.UUID
+	IsActive     bool
+	IsAdmin      bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	DeletedAt    *time.Time
+}
+
+type UserShort struct {
+	ID uuid.UUID
+	Name string
+}
+
+type UserWithDetail struct {
+	User
+	Department *DepartmentDetail
+	Role       *RoleDetail
+}
+
+// UserFilter Входящий параметры с отбором и пагинацией
+type UserFilter struct {
+	FirstName    string
+	SecondName   string
+	LastName     string
+	Email        string
+	DepartmentID *uuid.UUID
+	RoleID       *uuid.UUID
+	IsActive     filterbool.FilterBool
+	Pagination   PaginationRequest
+}
+
+// UserRepository Интерфейс для работы с репозиторием
+type UserRepository interface {
+	Create(ctx context.Context, user *User) error
+	Update(ctx context.Context, user *User) error
+	SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error
+	HardDelete(ctx context.Context, id uuid.UUID) error
+	SoftDelete(ctx context.Context, id uuid.UUID) error
+	GetByID(ctx context.Context, id uuid.UUID) (*User, error)
+	GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*UserWithDetail, error)
+	GetList(ctx context.Context, filter UserFilter) ([]*UserWithDetail, int64, error)
+	GetByEmail(ctx context.Context, email string) (*User, error)
+	GetByEmailWithDetail(ctx context.Context, email string) (*UserWithDetail, error)
+}
+
+// UserService Интерфейс для работы с сервисом
+type UserService interface {
+	Create(ctx context.Context, user *User) error
+	Update(ctx context.Context, user *User) error
+	SetIsActive(ctx context.Context, id uuid.UUID, isActive bool) error
+	HardDelete(ctx context.Context, id uuid.UUID) error
+	SoftDelete(ctx context.Context, id uuid.UUID) error
+	GetByID(ctx context.Context, id uuid.UUID) (*User, error)
+	GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*UserWithDetail, error)
+	GetList(ctx context.Context, filter UserFilter) (*PagedResult[*UserWithDetail], error)
+	GetByEmail(ctx context.Context, email string) (*User, error)
+	GetByEmailWithDetail(ctx context.Context, email string) (*UserWithDetail, error)
+	CheckOrCreateAdmin(ctx context.Context, adminCfg config.AdminConfig) error
+	Shutdown()
+}
+-e 
+
+=== FILE: ./internal/domain/answer.go ===
+package domain
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Answer struct {
+	ID         uuid.UUID
+	QuestionID uuid.UUID
+	Name       string
+	IsCorrect  bool
+	SortOrder  int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+-e 
+
+=== FILE: ./internal/domain/session.go ===
+package domain
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Session struct {
+	ID               uuid.UUID
+	UserID           uuid.UUID
+	RefreshTokenHash string
+	ExpiresAt        time.Time
+	CreatedAt        time.Time
+	RevokedAt        *time.Time
+	UserAgent        string
+	ClientIP         string
+}
+
+// SessionRepository интерфейс для работы с сессиями
+type SessionRepository interface {
+	Create(ctx context.Context, session *Session) error
+	GetByRefreshTokenHash(ctx context.Context, hash string) (*Session, error)
+	Revoke(ctx context.Context, id uuid.UUID) error
+	RevokeAllUserSessions(ctx context.Context, userID uuid.UUID) error
+	DeleteExpired(ctx context.Context) (int64, error)
+}
+
+// SessionService интерфейс для сервиса
+type SessionService interface {
+	CreateSession(ctx context.Context, userID uuid.UUID, refreshToken string, userAgent, clientIP string) (*Session, error)
+	RevokeSession(ctx context.Context, refreshToken string) error
+	RevokeAllUserSessions(ctx context.Context, userID uuid.UUID) error
+	ValidateRefreshToken(ctx context.Context, refreshToken string) (*Session, error)
+}
+-e 
+
+=== FILE: ./internal/domain/pagination.go ===
+package domain
+
+import "math"
+
+// Пагинация request ********************
+type PaginationRequest struct {
+	Page  int `json:"page"`
+	Limit int `json:"limit"`
+}
+
+func (p PaginationRequest) GetLimit() int {
+	if p.Limit <= 0 {
+		return 10
+	}
+	if p.Limit > 100 {
+		return 100
+	}
+	return p.Limit
+}
+
+// GetOffset рассчитывает сдвиг для SQL-запроса (OFFSET)
+func (p PaginationRequest) GetOffset() int {
+	if p.Page < 1 {
+		return 0
+	}
+	return (p.Page - 1) * p.GetLimit()
+}
+
+// Пагинация response ********************
+
+// PaginationResponse метаданные для клиента
+type PaginationResponse struct {
+	CurrentPage int   `json:"current_page"`
+	Limit       int   `json:"limit"`
+	TotalCount  int64 `json:"total_count"`
+	TotalPages  int   `json:"total_pages"`
+}
+
+// NewPaginationResponse — конструктор метаданных ответа
+func NewPaginationResponse(req PaginationRequest, totalCount int64) PaginationResponse {
+	limit := req.GetLimit()
+	totalPages := int(math.Ceil(float64(totalCount) / float64(limit)))
+	if totalPages == 0 {
+		totalPages = 1
+	}
+
+	page := req.Page
+	if page <= 0 {
+		page = 1
+	}
+
+	return PaginationResponse{
+		CurrentPage: page,
+		Limit:       limit,
+		TotalCount:  totalCount,
+		TotalPages:  totalPages,
+	}
+}
+
+// PagedResult — объединяем данные и пагинацию
+type PagedResult[T any] struct {
+	Data       []T                `json:"data"`
+	Pagination PaginationResponse `json:"pagination"`
+}
+-e 
+
+=== FILE: ./internal/domain/theme.go ===
+package domain
+
+import (
+	"context"
+	"time"
+
+	"github.com/Voltage11/tplatform/internal/types/filterbool"
+	"github.com/google/uuid"
+)
+
+type Theme struct {
+	ID          uuid.UUID
+	Name        string
+	Description string
+	IsActive    bool
+	CreatedByID uuid.UUID
+	CreatedAt   time.Time
+	DateBegin   *time.Time
+	DateEnd     *time.Time
+	MaxPoint    int
+	CheckPoint  int
+	ImgPath     string
+	DeletedAt   *time.Time
+}
+
+type ThemeWithDetail struct {
+	Theme
+	CreatedBy UserShort
+}
+
+type ThemeFilter struct {
+	Name          string
+	IsActive      filterbool.FilterBool
+	CreatedByID   *uuid.UUID
+	CreatedAtFrom *time.Time
+	CreatedAtTo   *time.Time
+	Pagination    PaginationRequest
+}
+
+// Repository Репозиторий для работы с темами
+type ThemeRepository interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*Theme, error)
+	GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*ThemeWithDetail, error)
+	Create(ctx context.Context, theme *Theme) error
+	Update(ctx context.Context, theme *Theme) error
+	Delete(ctx context.Context, id uuid.UUID) error
+	SetActive(ctx context.Context, id uuid.UUID, isActive bool) error
+	GetList(ctx context.Context, filter ThemeFilter) ([]*ThemeWithDetail, int64, error)
+}
+
+// Service Сервис для работы с темами
+type ThemeService interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*Theme, error)
+	GetByIDWithDetail(ctx context.Context, id uuid.UUID) (*ThemeWithDetail, error)
+	Create(ctx context.Context, theme *Theme) error
+	Update(ctx context.Context, theme *Theme) error
+	Delete(ctx context.Context, id uuid.UUID) error
+	SetActive(ctx context.Context, id uuid.UUID, isActive bool) error
+	GetList(ctx context.Context, filter ThemeFilter) (*PagedResult[*ThemeWithDetail], error)
+}
+-e 
+
+=== FILE: ./internal/domain/question.go ===
+package domain
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type QuestionType string
+
+func (q QuestionType) String() string {
+	return string(q)
+}
+
+const (
+	QuestionTypeSingle QuestionType = "single"
+	QuestionTypeMulti  QuestionType = "multi"
+)
+
+type Question struct {
+	ID           uuid.UUID
+	ThemeID      uuid.UUID
+	QuestionType QuestionType
+	Name         string
+	PointCorrect int
+	SortOrder    int
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+type QuestionRepository interface{
+	GetByID(ctx context.Context, id uuid.UUID) (*Question, error)
+	Create(ctx context.Context, question *Question) error
+	GetLastPositionInTheme(ctx context.Context, themeID uuid.UUID) (int, error)
+	Update(ctx context.Context, question *Question) error
+	SetSortOrder(ctx context.Context, id uuid.UUID, sortOrder int) error
+	Delete(ctx context.Context, id uuid.UUID) error
+	GetList(ctx context.Context, themeID uuid.UUID) ([]*Question, error)
+}
+
+type QuestionService interface{
+	GetByID(ctx context.Context, id uuid.UUID) (*Question, error)
+	Create(ctx context.Context, question *Question) error
+	Update(ctx context.Context, question *Question) error
+	Delete(ctx context.Context, id uuid.UUID) error
+	GetList(ctx context.Context, themeID uuid.UUID) ([]*Question, error)
+	SetSortOrder(ctx context.Context, id uuid.UUID, sortOrder int) error
+}-e 
+
+=== FILE: ./internal/appcontext/user.go ===
+package appcontext
+
+import (
+	"context"
+
+	"github.com/Voltage11/tplatform/internal/domain"
+)
+
+type ContextKey string
+
+const (
+	UserContextKey ContextKey = "user"
+)
+
+func GetUserFromContext(ctx context.Context) *domain.User {
+	user, ok := ctx.Value(UserContextKey).(*domain.User)
+	if !ok {
+		return nil
+	}
+	return user
+}
+
+func SetUserToContext(ctx context.Context, user *domain.User) context.Context {
+	return context.WithValue(ctx, UserContextKey, user)
+}-e 
+
+=== FILE: ./internal/middleware/userctx.go ===
+package middleware
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"github.com/Voltage11/tplatform/internal/appcontext"
+	"github.com/Voltage11/tplatform/internal/domain"
+	"github.com/Voltage11/tplatform/internal/handler/httputils"
+	"github.com/Voltage11/tplatform/pkg/logger"
+	"github.com/google/uuid"
+)
+
+type AuthMiddleware struct {
+	validator   TokenValidator
+	userService domain.UserService
+	logger      logger.Logger
+}
+
+// TokenValidator интерфейс для валидации токена
+type TokenValidator interface {
+	ValidateAccessToken(tokenString string) (uuid.UUID, error)
+}
+
+func NewAuthMiddleware(validator TokenValidator, userService domain.UserService, log logger.Logger) *AuthMiddleware {
+	return &AuthMiddleware{
+		validator:   validator,
+		userService: userService,
+		logger:      log,
+	}
+}
+
+func (u *AuthMiddleware) ExtractUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")		
+		if authHeader == "" {
+			next.ServeHTTP(w, r)
+			return
+		}		
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		token := parts[1]
+		
+		userID, err := u.validator.ValidateAccessToken(token)
+		if err != nil {
+			// Логируем причину
+			u.logger.Error("ExtractUser: invalid token", "err", err)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		user, err := u.userService.GetByID(r.Context(), userID)
+		if err != nil {
+			u.logger.Error("ExtractUser: GetByID error", "userID", userID, "err", err)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !user.IsActive {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), appcontext.UserContextKey, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+
+	})
+}
+
+func (u *AuthMiddleware) RequireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := appcontext.GetUserFromContext(r.Context())
+
+		if user == nil {
+			httputils.WriteErrorString(w, http.StatusUnauthorized, "требуется авторизация")
+			return
+		}
+
+		if !user.IsActive {
+			httputils.WriteErrorString(w, http.StatusUnauthorized, "требуется авторизация")
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (u *AuthMiddleware) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := appcontext.GetUserFromContext(r.Context())
+
+		if user == nil {
+			httputils.WriteErrorString(w, http.StatusUnauthorized, "требуется авторизация")
+			return
+		}
+
+		if !(user.IsActive && user.IsAdmin) {
+			httputils.WriteErrorString(w, http.StatusUnauthorized, "требуется авторизация")
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+-e 
+
+=== FILE: ./internal/config/config.go ===
+package config
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"time"
+
+	"github.com/ilyakaznacheev/cleanenv"
+)
+
+type Config struct {
+	Server   ServerConfig
+	Database DatabaseConfig
+	Logger   LoggerConfig
+	JWT      JWTConfig
+	Admin    AdminConfig
+	Upload UploadConfig
+}
+
+type UploadConfig struct {
+    Dir       string `env:"UPLOAD_DIR" env-default:"./uploads"`
+    MaxSizeMB int64  `env:"UPLOAD_MAX_SIZE_MB" env-default:"5"`
+}
+
+type AdminConfig struct {
+	Email    string `env:"ADMIN_EMAIL" env-required:"true"`
+	Password string `env:"ADMIN_PASSWORD" env-required:"true"`
+}
+
+type ServerConfig struct {
+	Port         string        `env:"SERVER_PORT" env-default:"8080"`
+	ReadTimeout  time.Duration `env:"SERVER_READ_TIMEOUT" env-default:"10s"`
+	WriteTimeout time.Duration `env:"SERVER_WRITE_TIMEOUT" env-default:"10s"`
+	IdleTimeout  time.Duration `env:"SERVER_IDLE_TIMEOUT" env-default:"60s"`
+	AllowedOrigins []string `env:"ALLOWED_ORIGINS" env-separator:"," env-required:"true"` 
+}
+
+type DatabaseConfig struct {
+	Host     string `env:"DB_HOST" env-default:"localhost"`
+	Port     string `env:"DB_PORT" env-default:"5432"`
+	User     string `env:"DB_USER" env-required:"true"`
+	Password string `env:"DB_PASSWORD" env-required:"true"`
+	DBName   string `env:"DB_NAME" env-required:"true"`
+	SSLMode  string `env:"DB_SSL_MODE" env-default:"disable"`
+	MaxConns int32  `env:"DB_MAX_CONNS" env-default:"10"`
+}
+
+func (c *DatabaseConfig) DSN() string {
+    u := url.URL{
+        Scheme: "postgres",
+        User:   url.UserPassword(c.User, c.Password),
+        Host:   fmt.Sprintf("%s:%s", c.Host, c.Port),
+        Path:   c.DBName,
+        RawQuery: url.Values{"sslmode": {c.SSLMode}}.Encode(),
+    }
+    return u.String()
+}
+
+// Validate проверяет корректность конфигурации БД
+func (c *DatabaseConfig) Validate() error {
+	if c.User == "" {
+		return fmt.Errorf("DB_USER не может быть пустым")
+	}
+	if c.Password == "" {
+		return fmt.Errorf("DB_PASSWORD не может быть пустым")
+	}
+	if c.DBName == "" {
+		return fmt.Errorf("DB_NAME не может быть пустым")
+	}
+	return nil
+}
+
+type LoggerConfig struct {
+	Level string `env:"LOG_LEVEL" env-default:"info"`
+}
+
+type JWTConfig struct {
+	Secret     string        `env:"JWT_SECRET" env-required:"true"`
+	AccessTTL  time.Duration `env:"JWT_ACCESS_TTL" env-default:"15m"`
+	RefreshTTL time.Duration `env:"JWT_REFRESH_TTL" env-default:"720h"` // 30 дней
+}
+
+// Validate проверяет корректность JWT конфигурации
+func (c *JWTConfig) Validate() error {
+	if c.Secret == "" {
+		return fmt.Errorf("JWT_SECRET не может быть пустым")
+	}
+	// if c.ExpireHours <= 0 {
+	// 	return fmt.Errorf("JWT_EXPIRE_HOURS должен быть больше 0")
+	// }
+	return nil
+}
+
+func New() (*Config, error) {
+	var cfg Config
+
+	// Пробуем прочитать .env, если он есть
+	if _, err := os.Stat(".env"); err == nil {
+		if err := cleanenv.ReadConfig(".env", &cfg); err != nil {
+			return nil, fmt.Errorf("ошибка чтения файла .env: %w", err)
+		}
+	}
+
+	// Читаем переменные окружения (перезаписывают значения из .env)
+	if err := cleanenv.ReadEnv(&cfg); err != nil {
+		return nil, fmt.Errorf("ошибка чтения переменных окружения: %w", err)
+	}
+
+	// Валидация
+	if err := cfg.Database.Validate(); err != nil {
+		return nil, fmt.Errorf("невалидная конфигурация БД: %w", err)
+	}
+	if err := cfg.JWT.Validate(); err != nil {
+		return nil, fmt.Errorf("невалидная JWT конфигурация: %w", err)
+	}
+
+	return &cfg, nil
+}-e 
+
+=== FILE: ./project_code.txt ===
+-e 
+
+=== FILE: ./cmd/api/main.go ===
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+
+	"github.com/Voltage11/tplatform/internal/config"
+	"github.com/Voltage11/tplatform/internal/db"
+	"github.com/Voltage11/tplatform/internal/handler"
+	authmw "github.com/Voltage11/tplatform/internal/middleware"
+	"github.com/Voltage11/tplatform/internal/repository"
+	"github.com/Voltage11/tplatform/internal/service"
+	"github.com/Voltage11/tplatform/pkg/jwt"
+	"github.com/Voltage11/tplatform/pkg/logger"
+)
+
+const (
+	loggerLevel     = "info"
+	shutdownTimeout = 30 * time.Second // максимальное время на завершение
+)
+
+func main() {
+	// Загрузка конфигурации
+	cfg, err := config.New()
+	if err != nil {
+		log.Fatalf("ошибка получения конфигурации: %v", err)
+	}
+
+	// Инициализация логгера
+	appLogger := logger.New(loggerLevel)
+
+	// Подключение к Postgres
+	dbPostgres, err := db.NewPostgresDB(&cfg.Database)
+	if err != nil {
+		log.Fatalf("ошибка подключения к postgres: %v", err)
+	}
+	defer dbPostgres.Close()
+	appLogger.Info("Подключение к БД успешно")
+
+	// Репозитории
+	sessionRepo := repository.NewSessionRepository(dbPostgres)
+	permissionRepo := repository.NewPermissionsRepository(dbPostgres)
+	departmentRepo := repository.NewDepartmentRepository(dbPostgres)
+	roleRepo := repository.NewRoleRepository(dbPostgres)
+	userRepo := repository.NewUserRepository(dbPostgres)
+	themeRepo := repository.NewThemeRepository(dbPostgres)
+	questionRepo := repository.NewQuestionRepository(dbPostgres)
+
+	// Сервисы
+	jwtCfg := jwt.Config{
+		SecretKey:  cfg.JWT.Secret,
+		AccessTTL:  cfg.JWT.AccessTTL,
+		RefreshTTL: cfg.JWT.RefreshTTL,
+	}
+
+	permissionService := service.NewPermissionService(permissionRepo)
+	defer permissionService.Shutdown()
+
+	authService := service.NewAuthService(userRepo, sessionRepo, jwtCfg)
+	departmentService := service.NewDepartmentService(departmentRepo, permissionService)
+	roleService := service.NewRoleService(roleRepo, permissionService)
+	userService := service.NewUserService(userRepo, permissionService, dbPostgres)
+	defer userService.Shutdown() // остановка кэша пользователей
+	themeService := service.NewThemeService(themeRepo, permissionService)
+	questionService := service.NewQuestionService(questionRepo, permissionService, dbPostgres)
+
+	// Создание / проверка администратора
+	if err := userService.CheckOrCreateAdmin(context.Background(), cfg.Admin); err != nil {
+		log.Fatalf("ошибка создания админа: %v", err)
+	}
+
+	// Роутер
+	r := chi.NewRouter()	
+
+	// Middleware
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   cfg.Server.AllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+	r.Use(middleware.RequestID)
+	r.Use(middleware.ClientIPFromRemoteAddr)
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(cfg.Server.ReadTimeout))
+
+	authMiddleware := authmw.NewAuthMiddleware(authService, userService, appLogger)
+	r.Use(authMiddleware.ExtractUser)
+
+	handler.NewAuthHandlers(r, authMiddleware, authService, userService, appLogger)
+	handler.NewDepartmentHandler(r, authMiddleware, departmentService)
+	handler.NewRoleHandler(r, authMiddleware, roleService)
+	handler.NewUserHandler(r, authMiddleware, userService)
+	handler.NewPermissionHandler(r, authMiddleware, permissionService)
+	handler.NewThemeHandlers(r, authMiddleware, themeService, questionService)
+	handler.NewUploadHandler(r, authMiddleware, cfg.Upload, appLogger)
+
+	r.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir("./uploads"))))
+
+	// HTTP-сервер
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%s", cfg.Server.Port),
+		Handler:      r,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
+	}
+
+	// Установим уровень логирования из конфигурации
+	appLogger.SetLevel(cfg.Logger.Level)
+
+	// Запуск сервера в фоне и ожидание сигнала для остановки
+	// Канал для получения ошибок от сервера
+	serverErr := make(chan error, 1)
+
+	go func() {
+		appLogger.Info("Сервер запущен", "port", cfg.Server.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- fmt.Errorf("ошибка сервера: %w", err)
+		}
+	}()
+
+	// Канал для сигналов ОС
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Ожидаем либо ошибку от сервера, либо сигнал на завершение
+	select {
+	case err := <-serverErr:
+		appLogger.Error("Критическая ошибка сервера", "error", err)
+		// не вызываем os.Exit, дадим defer отработать
+		// но завершим программу с ненулевым кодом
+		log.Fatalf("Сервер упал: %v", err)
+
+	case sig := <-quit:
+		appLogger.Info("Получен сигнал на остановку", "signal", sig.String())
+
+		// Создаём контекст с таймаутом для плавного завершения
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		// 1. Останавливаем HTTP-сервер (перестаём принимать новые запросы)
+		if err := srv.Shutdown(ctx); err != nil {
+			appLogger.Error("Ошибка при остановке HTTP-сервера", "error", err)
+		} else {
+			appLogger.Info("HTTP-сервер остановлен")
+		}
+
+		// 2. Останавливаем фоновые сервисы (если требуется)
+		// permissionService.Shutdown() вызовется через defer, но можно и явно здесь
+		// userService.Shutdown() тоже через defer
+		// Дополнительно можно добавить явные вызовы с таймаутом, если нужно гарантировать порядок:
+		// permissionService.Shutdown()
+		// userService.Shutdown()
+
+		// 3. Закрытие БД произойдёт через defer dbPostgres.Close()
+
+		appLogger.Info("Приложение завершено корректно")
+		// Выход с кодом 0 произойдёт после возврата из main
+	}
+}
+-e 
+
+=== FILE: ./cmd/migrate/main.go ===
+// Применение миграций
+// go run cmd/migrate/main.go -cmd up
+
+// Откат всех миграций
+// go run cmd/migrate/main.go -cmd down
+
+// Откат на 2 шага
+// go run cmd/migrate/main.go -cmd down -step 2
+
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+
+	"github.com/Voltage11/tplatform/internal/config"
+	"github.com/golang-migrate/migrate"
+	_ "github.com/golang-migrate/migrate/database/postgres"
+	_ "github.com/golang-migrate/migrate/source/file"
+	_ "github.com/lib/pq"
+)
+
+func main() {
+	// Инициализируем флаги напрямую
+	command := flag.String("cmd", "up", "Команда миграции: up (накатить) или down (откатить)")
+	step := flag.Int("step", 0, "Количество шагов для отката (используется с cmd=down)")
+	flag.Parse()
+
+	// Валидация входных данных на старте
+	if *command != "up" && *command != "down" {
+		log.Fatalf("Ошибка: недопустимая команда %q. Используйте 'up' или 'down'", *command)
+	}
+
+	cfg, err := config.New()
+	if err != nil {
+		log.Fatalf("Ошибка загрузки конфигурации: %v", err)
+	}
+
+	// Передаем значения (разъименовываем указатели через *)
+	if err := runMigrations(cfg.Database.DSN(), *command, *step); err != nil {
+		log.Fatalf("Миграция завершилась с ошибкой: %v", err)
+	}
+}
+
+func runMigrations(databaseURL string, command string, step int) error {
+	m, err := migrate.New("file://migrations", databaseURL)
+	if err != nil {
+		return fmt.Errorf("не удалось инициализировать мигратор: %w", err)
+	}
+	defer m.Close()
+
+	switch command {
+	case "up":
+		if err := m.Up(); err != nil {
+			if errors.Is(err, migrate.ErrNoChange) {
+				log.Println("База данных в актуальном состоянии (нет новых миграций)")
+				return nil
+			}
+			return fmt.Errorf("ошибка при выполнении UP: %w", err)
+		}
+		log.Println("Все новые миграции успешно применены!")
+
+	case "down":
+		if step > 0 {
+			if err := m.Steps(-step); err != nil {
+				return fmt.Errorf("ошибка при откате на %d шагов: %w", step, err)
+			}
+			log.Printf("Успешно откатано миграций: %d шагов\n", step)
+		} else {
+			if err := m.Down(); err != nil {
+				if errors.Is(err, migrate.ErrNoChange) {
+					log.Println("Нечего откатывать, база пуста")
+					return nil
+				}
+				return fmt.Errorf("ошибка при полном откате DOWN: %w", err)
+			}
+			log.Println("Все миграции успешно откатаны (база очищена)!")
+		}
+	}
+
+	return nil
+}
+-e 
+
+=== FILE: ./pkg/helpers/uuid.go ===
+package helpers
+
+import "github.com/google/uuid"
+
+func ScanNullableUUID(src uuid.NullUUID) *uuid.UUID {
+	if src.Valid {
+		return &src.UUID
+	}
+	return nil
+}
+-e 
+
+=== FILE: ./pkg/logger/logger.go ===
+package logger
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+)
+
+type Logger interface {
+	// Стандартные методы
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+
+	// Методы с поддержкой контекста
+	DebugCtx(ctx context.Context, msg string, args ...any)
+	InfoCtx(ctx context.Context, msg string, args ...any)
+	WarnCtx(ctx context.Context, msg string, args ...any)
+	ErrorCtx(ctx context.Context, msg string, args ...any)
+
+	SetLevel(levelStr string)
+}
+
+type appLogger struct {
+	logger   *slog.Logger
+	levelVar *slog.LevelVar
+}
+
+func New(initialLevel string) Logger {
+	levelVar := &slog.LevelVar{}
+	levelVar.Set(parseLevel(initialLevel))
+
+	// Базовый JSON обработчик
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: levelVar,
+	})
+
+	return &appLogger{
+		logger:   slog.New(handler),
+		levelVar: levelVar,
+	}
+}
+
+func (l *appLogger) Info(msg string, args ...any) {
+	l.logger.Info(msg, args...)
+}
+func (l *appLogger) Debug(msg string, args ...any) { l.logger.Debug(msg, args...) }
+func (l *appLogger) Warn(msg string, args ...any)  { l.logger.Warn(msg, args...) }
+func (l *appLogger) Error(msg string, args ...any) { l.logger.Error(msg, args...) }
+
+func (l *appLogger) InfoCtx(ctx context.Context, msg string, args ...any) {
+	l.logger.InfoContext(ctx, msg, args...)
+}
+func (l *appLogger) DebugCtx(ctx context.Context, msg string, args ...any) {
+	l.logger.DebugContext(ctx, msg, args...)
+}
+func (l *appLogger) WarnCtx(ctx context.Context, msg string, args ...any) {
+	l.logger.WarnContext(ctx, msg, args...)
+}
+func (l *appLogger) ErrorCtx(ctx context.Context, msg string, args ...any) {
+	l.logger.ErrorContext(ctx, msg, args...)
+}
+
+func (l *appLogger) SetLevel(levelStr string) {
+	newLevel := parseLevel(levelStr)
+	l.levelVar.Set(newLevel)
+
+	fmt.Fprintf(os.Stderr, "уровень логирования изменен на: %s\n", levelStr)
+}
+
+func parseLevel(levelStr string) slog.Level {
+	switch levelStr {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+-e 
+
+=== FILE: ./pkg/hash/hash.go ===
+package hash
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+)
+
+// GenerateNewRandomStr генерирует случайную строку длиной 32 байта
+func GenerateNewRandomStr() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
+}
+
+// ToHash хеширует строку
+func ToHash(str string) string {
+	h := sha256.Sum256([]byte(str))
+	return base64.URLEncoding.EncodeToString(h[:])
+}
+
+func IsValidHash(hash, str string) bool {
+	if hash == "" {
+		return false
+	}
+
+	return hash == ToHash(str)
+}
+-e 
+
+=== FILE: ./pkg/jwt/jwt.go ===
+package jwt
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/Voltage11/tplatform/pkg/hash"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+)
+
+type Config struct {
+	SecretKey  string
+	AccessTTL  time.Duration
+	RefreshTTL time.Duration
+}
+
+type Claims struct {
+	UserID uuid.UUID `json:"user_id"`
+	jwt.RegisteredClaims
+}
+
+type JWTService struct {
+	cfg Config
+}
+
+func NewJWTService(cfg Config) *JWTService {
+	return &JWTService{cfg: cfg}
+}
+
+// GenerateAccessToken создаёт короткоживущий access-токен
+func (j *JWTService) GenerateAccessToken(userID uuid.UUID) (string, error) {
+	claims := Claims{
+		UserID: userID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(j.cfg.AccessTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(j.cfg.SecretKey))
+}
+
+// GenerateRefreshToken генерирует случайную строку
+func (j *JWTService) GenerateRefreshToken() (string, error) {
+	return hash.GenerateNewRandomStr()
+}
+
+// ValidateAccessToken проверяет access-токен и возвращает userID как строку
+func (j *JWTService) ValidateAccessToken(tokenString string) (uuid.UUID, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return uuid.Nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(j.cfg.SecretKey), nil
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+		return claims.UserID, nil // возвращаем uuid.UUID
+	}
+	return uuid.Nil, fmt.Errorf("invalid token")
+}
+
+// GetAccessTTL возвращает время жизни access токена
+func (j *JWTService) GetAccessTTL() time.Duration {
+	return j.cfg.AccessTTL
+}
+
+// GetRefreshTTL возвращает время жизни refresh токена
+func (j *JWTService) GetRefreshTTL() time.Duration {
+	return j.cfg.RefreshTTL
+}-e 
+
+=== FILE: ./pkg/password/password.go ===
+package password
+
+import (
+    "golang.org/x/crypto/bcrypt"
+)
+
+const cost = 12 
+
+// Hash возвращает bcrypt-хеш пароля
+func Hash(plain string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(plain), cost)
+    if err != nil {
+        return "", err
+    }
+    return string(bytes), nil
+}
+
+// Verify сравнивает пароль с bcrypt-хешом
+func Verify(hashed, plain string) bool {
+    err := bcrypt.CompareHashAndPassword([]byte(hashed), []byte(plain))
+    return err == nil
+}-e 
+
+=== FILE: ./go.mod ===
+module github.com/Voltage11/tplatform
+
+go 1.26.3
+
+require github.com/ilyakaznacheev/cleanenv v1.5.0
+
+require (
+	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
+	github.com/go-playground/locales v0.14.1 // indirect
+	github.com/go-playground/universal-translator v0.18.1 // indirect
+	github.com/huandu/go-clone v1.7.3 // indirect
+	github.com/huandu/xstrings v1.4.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/leodido/go-urn v1.4.0 // indirect
+	github.com/lib/pq v1.12.3 // indirect
+	golang.org/x/crypto v0.52.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+)
+
+require (
+	github.com/BurntSushi/toml v1.2.1 // indirect
+	github.com/go-chi/chi/v5 v5.3.0
+	github.com/go-chi/cors v1.2.2
+	github.com/go-playground/validator/v10 v10.30.3
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/golang-migrate/migrate v3.5.4+incompatible
+	github.com/google/uuid v1.6.0
+	github.com/huandu/go-sqlbuilder v1.42.1
+	github.com/jackc/pgerrcode v0.0.0-20250907135507-afb5586c32a6
+	github.com/jackc/pgx/v5 v5.10.0
+	github.com/joho/godotenv v1.5.1 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+	olympos.io/encoding/edn v0.0.0-20201019073823-d3554ca0b0a3 // indirect
+)
+-e 
+
+=== FILE: ./migrations/002_create_themes.up.sql ===
+-- 1. Темы
+CREATE TABLE IF NOT EXISTS themes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_by_id UUID NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    date_begin TIMESTAMP WITH TIME ZONE,
+    date_end TIMESTAMP WITH TIME ZONE,
+    max_point INT NOT NULL DEFAULT 0,
+    check_point INT NOT NULL DEFAULT 0,
+    img_path VARCHAR(255),
+    --correct_points INT NOT NULL DEFAULT 0,  
+    deleted_at TIMESTAMP WITH TIME ZONE,
+
+    CONSTRAINT fk_themes_users FOREIGN KEY (created_by_id) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- 2. Вопросы
+CREATE TABLE IF NOT EXISTS questions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    theme_id UUID NOT NULL,
+    question_type VARCHAR(50) NOT NULL,
+    name TEXT NOT NULL,                
+    point_correct INT NOT NULL DEFAULT 0,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_questions_themes FOREIGN KEY (theme_id) REFERENCES themes(id) ON DELETE CASCADE
+);
+
+-- 3. Варианты ответов
+CREATE TABLE IF NOT EXISTS answers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    question_id UUID NOT NULL,
+    name TEXT NOT NULL,                 
+    is_correct BOOLEAN NOT NULL DEFAULT FALSE,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_answers_questions FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_questions_theme_id ON questions(theme_id);
+CREATE INDEX idx_answers_question_id ON answers(question_id);
+CREATE INDEX idx_themes_created_by ON themes(created_by_id);-e 
+
+=== FILE: ./migrations/001_create_tables.down.sql ===
+DROP TABLE IF EXISTS role_permissions;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS departmens;
+DROP TABLE IF EXISTS roles;-e 
+
+=== FILE: ./migrations/001_create_tables.up.sql ===
+-- 1. Отделы
+CREATE TABLE IF NOT EXISTS departments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+
+-- 2. Роли (должна быть перед users)
+CREATE TABLE IF NOT EXISTS roles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(50) NOT NULL UNIQUE,
+    description  TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- 3. Пользователи
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    first_name VARCHAR(100) NOT NULL,
+    second_name VARCHAR(100),
+    last_name VARCHAR(100) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    department_id UUID,
+    role_id UUID,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    is_admin BOOLEAN NOT NULL DEFAULT false,   
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    
+    CONSTRAINT fk_users_departments FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL,
+    CONSTRAINT fk_users_roles FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE SET NULL
+);
+
+-- Индексы для users
+CREATE INDEX idx_users_email ON users(email) WHERE deleted_at IS NULL;
+CREATE INDEX idx_users_department_id ON users(department_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_users_role_id ON users(role_id) WHERE deleted_at IS NULL;  -- исправлено
+CREATE INDEX idx_users_is_active ON users(is_active) WHERE deleted_at IS NULL;
+CREATE INDEX idx_users_last_name ON users(last_name) WHERE deleted_at IS NULL;
+
+-- Индекс для departments
+CREATE INDEX idx_departments_name ON departments(name) WHERE deleted_at IS NULL;
+
+-- 4. Сессии
+CREATE TABLE IF NOT EXISTS sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    refresh_token_hash VARCHAR(255) NOT NULL UNIQUE,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    user_agent TEXT,
+    client_ip TEXT
+);
+
+CREATE INDEX idx_sessions_user_id ON sessions(user_id) WHERE revoked_at IS NULL;
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+
+-- 5. Права ролей
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id UUID NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    entity_name VARCHAR(100) NOT NULL,
+    action_name VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (role_id, entity_name, action_name)
+);-e 
+
+=== FILE: ./migrations/002_create_themes.down.sql ===
+DROP TABLE IF EXISTS answers;
+DROP TABLE IF EXISTS questions;
+DROP TABLE IF EXISTS themes;-e 
+

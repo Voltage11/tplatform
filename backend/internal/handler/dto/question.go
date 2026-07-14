@@ -14,7 +14,7 @@ type QuestionCreateRequest struct {
 }
 
 func (q *QuestionCreateRequest) Validate() error {
-	if q.QuestionType != domain.QuestionTypeMulti.String() || q.QuestionType != domain.QuestionTypeSingle.String() {
+	if q.QuestionType != domain.QuestionTypeMulti.String() && q.QuestionType != domain.QuestionTypeSingle.String() {
 		return apperror.NewBadRequest("Тип вопроса может иметь два значения: single, multi", nil)
 	}
 
@@ -47,8 +47,8 @@ func (q *QuestionUpdateRequest) Validate() error {
 	return nil
 }
 
-type QuestionSetOrderRequest struct{
-	SortOrder    int    `json:"sort_order" validate:"required"`
+type QuestionSetOrderRequest struct {
+	SortOrder int `json:"sort_order" validate:"required"`
 }
 
 type QuestionResponse struct {
@@ -64,23 +64,23 @@ type QuestionResponse struct {
 
 func QuestionToResponse(question *domain.Question) *QuestionResponse {
 	return &QuestionResponse{
-		ID: question.ID.String(),
-		ThemeID: question.ThemeID.String(),
+		ID:           question.ID.String(),
+		ThemeID:      question.ThemeID.String(),
 		QuestionType: string(question.QuestionType),
-		Name: question.Name,
+		Name:         question.Name,
 		PointCorrect: question.PointCorrect,
-		SortOrder: question.SortOrder,
-		CreatedAt: question.CreatedAt.Format(time.RFC3339Nano),
-		UpdatedAt: question.UpdatedAt.Format(time.RFC3339Nano),
+		SortOrder:    question.SortOrder,
+		CreatedAt:    question.CreatedAt.Format(time.RFC3339Nano),
+		UpdatedAt:    question.UpdatedAt.Format(time.RFC3339Nano),
 	}
 }
 
-func  QuestionsToResponseSlice(questions []*domain.Question) []*QuestionResponse {
+func QuestionsToResponseSlice(questions []*domain.Question) []*QuestionResponse {
 	out := make([]*QuestionResponse, len(questions))
 
 	for i, item := range questions {
 		out[i] = QuestionToResponse(item)
 	}
 
-	return  out
+	return out
 }

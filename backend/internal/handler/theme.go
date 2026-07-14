@@ -204,7 +204,7 @@ func (h *themeHandlers) CreateQuestion(w http.ResponseWriter, r *http.Request) {
 
 	question := domain.Question{
 		ThemeID:      themeID,
-		QuestionType: dto.GetQuestionTypeFromStr(questionCreateRequest.Name),
+		QuestionType: dto.GetQuestionTypeFromStr(questionCreateRequest.QuestionType),
 		Name:         questionCreateRequest.Name,
 		PointCorrect: questionCreateRequest.PointCorrect,
 	}
@@ -244,7 +244,7 @@ func (h *themeHandlers) UpdateQuestion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	question.QuestionType = dto.GetQuestionTypeFromStr(questionUpdateRequest.Name)
+	question.QuestionType = dto.GetQuestionTypeFromStr(questionUpdateRequest.QuestionType)
 	question.Name = questionUpdateRequest.Name
 	question.PointCorrect = questionUpdateRequest.PointCorrect
 
@@ -283,8 +283,7 @@ func (h *themeHandlers) ChangeSortQuestion(w http.ResponseWriter, r *http.Reques
 	}
 
 	id, err := httputils.ParseUUID(r, "id")
-
-	if err := h.questionService.Delete(r.Context(), id); err != nil {
+	if err != nil {
 		httputils.WriteError(w, err)
 		return
 	}
